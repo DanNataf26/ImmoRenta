@@ -565,8 +565,15 @@ for (dept, typo), prix in dept_prix_typo.items():
 # commune/département prend alors le relais côté simulateur).
 secteurs = {str(t): {} for t in RESOLUTIONS_SECTEUR}
 nb_secteurs_fiables = 0
-marges_mesurees = []  # pour le diagnostic de dispersion ci-dessous
+# Diagnostic de dispersion : mesuré sur TOUS les secteurs à effectif suffisant
+# (>= 15 ventes), qu'ils passent ou non le critère de marge - mesurer
+# seulement les secteurs déjà "fiables" biaiserait le résultat vers le bas
+# (on aurait alors sélectionné par construction les secteurs les plus
+# homogènes, et non un échantillon représentatif de la vraie dispersion).
+marges_mesurees = []
 for (taille_m, cell, typo), prix in secteurs_prix_typo.items():
+    if len(prix) >= 15:
+        marges_mesurees.append(statistics.stdev(prix) / statistics.mean(prix))
     fiable, marge, mediane = est_fiable(prix)
     if not fiable:
         continue
@@ -578,8 +585,6 @@ for (taille_m, cell, typo), prix in secteurs_prix_typo.items():
         "marge": round(marge, 3),
     }
     nb_secteurs_fiables += 1
-    if len(prix) >= 15:
-        marges_mesurees.append(statistics.stdev(prix) / statistics.mean(prix))
 
 print(
     f"Prix par typologie calculé pour {len(communes_prix_typo)} paires commune/typologie, "
@@ -592,6 +597,9 @@ print(
 # détecter, mois après mois, une dérive structurelle du marché qui rendrait
 # le plancher/la marge actuels mal calibrés (voir historique du projet pour
 # la simulation ayant servi à les fixer : plancher 15, marge cible 20%).
+# Stocké dans le fichier exporté (pas seulement dans les logs) pour que le
+# simulateur puisse afficher une alerte visible, pas seulement discrète.
+diagnostic_dispersion = None
 if marges_mesurees:
     cvs_tries = sorted(marges_mesurees)
     n_cv = len(cvs_tries)
@@ -605,7 +613,16 @@ if marges_mesurees:
     # Repère de référence mesuré le 10/09/2026 sur toute la France : médiane ~40%.
     # Alerte si dérive de plus de 10 points par rapport à cette référence.
     REFERENCE_MEDIANE_CV = 0.401
-    if abs(mediane_cv - REFERENCE_MEDIANE_CV) > 0.10:
+    ecart = abs(mediane_cv - REFERENCE_MEDIANE_CV)
+    alerte = ecart > 0.10
+    diagnostic_dispersion = {
+        "mediane_cv": round(mediane_cv, 3),
+        "reference_cv": REFERENCE_MEDIANE_CV,
+        "ecart": round(ecart, 3),
+        "alerte": alerte,
+        "n_secteurs": n_cv,
+    }
+    if alerte:
         print(
             f"⚠️  ATTENTION : la dispersion médiane mesurée ({mediane_cv*100:.1f}%) s'écarte de plus "
             f"de 10 points de la référence historique ({REFERENCE_MEDIANE_CV*100:.1f}%) - le plancher/la "
@@ -661,8 +678,9 @@ print(f"Encadrement des loyers Paris {annee_encadrement} intégré ({len(quartie
 result["departements"] = departements
 result["secteurs"] = secteurs
 result["_millesime_loyers"] = millesime_loyers
+result["_diagnostic_dispersion"] = diagnostic_dispersion
 
 with open(DEST_JSON, "w", encoding="utf-8") as f:
     json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
 
-print(f"{len(result) - 4} communes + {len(departements)} départements exportés dans {DEST_JSON}")
+print(f"{len(result) - 5} communes + {len(departements)} départements exportés dans {DEST_JSON}")
