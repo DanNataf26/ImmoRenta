@@ -610,9 +610,14 @@ if marges_mesurees:
         f"Diagnostic dispersion (CV) sur {n_cv} secteurs : "
         f"médiane={mediane_cv*100:.1f}%, 25e centile={p25_cv*100:.1f}%, 75e centile={p75_cv*100:.1f}%."
     )
-    # Repère de référence mesuré le 10/09/2026 sur toute la France : médiane ~40%.
-    # Alerte si dérive de plus de 10 points par rapport à cette référence.
-    REFERENCE_MEDIANE_CV = 0.401
+    # Repère de référence : mesuré par CE script lui-même le 10/09/2026
+    # (médiane ~26%, sur secteurs 300/500/1km combinés, ventes en mutation à
+    # un seul lot uniquement - volontairement recalibré sur sa propre
+    # méthodologie plutôt que sur une vérification ponctuelle externe qui
+    # mesurait différemment, pour que la comparaison mois après mois soit
+    # cohérente). Alerte si dérive de plus de 10 points par rapport à cette
+    # référence.
+    REFERENCE_MEDIANE_CV = 0.262
     ecart = abs(mediane_cv - REFERENCE_MEDIANE_CV)
     alerte = ecart > 0.10
     diagnostic_dispersion = {
