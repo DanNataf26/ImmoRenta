@@ -44,11 +44,49 @@ LOYERS_FICHIERS_2025 = {
 }
 COMMUNE_REFERENCE = "01053"  # Bourg-en-Bresse : sert à identifier les typologies automatiquement
 
-# Prix par typologie (T1-T2/T3+) calculé sur données DVF BRUTES, avec fenêtre
-# adaptative : 1 an par défaut, élargie jusqu'à MAX_ANNEES si le nombre de
-# ventes est insuffisant pour une commune/typologie donnée.
-SEUIL_VENTES_TYPOLOGIE = 20
+# Prix par typologie (T1-T2/T3+ ou maison) calculé sur données DVF BRUTES,
+# avec fenêtre adaptative : 1 an par défaut, élargie jusqu'à MAX_ANNEES si
+# le critère de fiabilité (marge d'erreur par rangs) n'est pas atteint.
+#
+# Remplace l'ancien seuil fixe (20 ventes partout) par un critère à deux
+# conditions cumulatives, validé par simulation Monte Carlo (voir historique
+# du projet) sur la dispersion RÉELLE des prix mesurée sur toute la France :
+#   - PLANCHER_VENTES : en dessous, la méthode par rangs elle-même devient
+#     statistiquement instable (zone d'erreur non liée aux données)
+#   - MARGE_CIBLE : marge d'erreur (méthode distribution-free par
+#     statistiques d'ordre, valide quelle que soit la forme de la
+#     distribution - contrairement à la formule normale 1.253*sigma/sqrt(n))
+PLANCHER_VENTES = 15
+MARGE_CIBLE = 0.20
 MAX_ANNEES_TYPOLOGIE = 5
+
+
+def marge_rangs(prix_tries, mediane, z=1.96):
+    """Marge d'erreur relative (distribution-free, par statistiques d'ordre)
+    autour de la médiane. prix_tries doit déjà être trié. Renvoie None si
+    l'effectif est trop faible pour que les indices de rang soient valides."""
+    n = len(prix_tries)
+    if n < 3 or mediane <= 0:
+        return None
+    demi_largeur_rang = z * math.sqrt(n) / 2
+    j = max(0, round(n / 2 - demi_largeur_rang) - 1)
+    k = min(n - 1, round(n / 2 + demi_largeur_rang))
+    if j >= k:
+        return None
+    return ((prix_tries[k] - prix_tries[j]) / 2) / mediane
+
+
+def est_fiable(prix):
+    """Applique le critère à deux conditions cumulatives (plancher + marge).
+    Renvoie (fiable: bool, marge: float|None, mediane: float|None)."""
+    if len(prix) < PLANCHER_VENTES:
+        return False, None, None
+    prix_tries = sorted(prix)
+    mediane = statistics.median(prix_tries)
+    marge = marge_rangs(prix_tries, mediane)
+    if marge is None:
+        return False, None, mediane
+    return marge <= MARGE_CIBLE, marge, mediane
 
 # Résolutions de la grille géographique fine (secteur), en mètres, du plus
 # fin au plus large - cascade utilisée par le simulateur au moment de la
@@ -438,9 +476,11 @@ for typologie in LOYERS_FICHIERS:
 print(f"Loyers {millesime_loyers} par typologie intégrés (commune + département).")
 
 # ---------------------------------------------------------------------------
-# 4) Prix par typologie (T1-T2 / T3+), calculé sur DVF BRUT (transaction par
-#    transaction), avec fenêtre adaptative : 1 an par défaut, élargie jusqu'à
-#    5 ans si moins de 20 ventes pour une commune/typologie donnée.
+# 4) Prix par typologie (T1-T2 / T3+ / maison), calculé sur DVF BRUT
+#    (transaction par transaction), avec fenêtre adaptative : 1 an par
+#    défaut, élargie jusqu'à 5 ans si le critère de fiabilité (plancher +
+#    marge d'erreur par rangs) n'est pas atteint - appliqué UNIFORMÉMENT au
+#    secteur, à la commune ET au département (plus de seuil fixe séparé).
 # ---------------------------------------------------------------------------
 communes_prix_typo = defaultdict(list)
 dept_prix_typo = defaultdict(list)
@@ -463,19 +503,19 @@ for i, annee in enumerate(annees_dvf, start=1):
 
     nouveaux_c = 0
     for key, prix in communes_prix_typo.items():
-        if key not in locked_communes and len(prix) >= SEUIL_VENTES_TYPOLOGIE:
+        if key not in locked_communes and est_fiable(prix)[0]:
             locked_communes.add(key)
             fenetre_communes[key] = i
             nouveaux_c += 1
     nouveaux_d = 0
     for key, prix in dept_prix_typo.items():
-        if key not in locked_dept and len(prix) >= SEUIL_VENTES_TYPOLOGIE:
+        if key not in locked_dept and est_fiable(prix)[0]:
             locked_dept.add(key)
             fenetre_dept[key] = i
             nouveaux_d += 1
     nouveaux_s = 0
     for key, prix in secteurs_prix_typo.items():
-        if key not in locked_secteurs and len(prix) >= SEUIL_VENTES_TYPOLOGIE:
+        if key not in locked_secteurs and est_fiable(prix)[0]:
             locked_secteurs.add(key)
             fenetre_secteurs[key] = i
             nouveaux_s += 1
@@ -497,40 +537,49 @@ for (code, typo), prix in communes_prix_typo.items():
         continue
     if code not in result:
         result[code] = {"nom": ""}
+    fiable, marge, mediane = est_fiable(prix)
     result[code].setdefault("appartement_typologie", {})
     result[code]["appartement_typologie"][typo] = {
-        "mediane": round(statistics.median(prix)),
+        "mediane": round(mediane if mediane is not None else statistics.median(prix)),
         "nb": len(prix),
         "fenetre_annees": fenetre_communes[(code, typo)],
-        "fiable": len(prix) >= SEUIL_VENTES_TYPOLOGIE,
+        "fiable": fiable,
+        "marge": round(marge, 3) if marge is not None else None,
     }
 
 for (dept, typo), prix in dept_prix_typo.items():
     if not prix or dept not in departements:
         continue
+    fiable, marge, mediane = est_fiable(prix)
     departements[dept].setdefault("appartement_typologie", {})
     departements[dept]["appartement_typologie"][typo] = {
-        "mediane": round(statistics.median(prix)),
+        "mediane": round(mediane if mediane is not None else statistics.median(prix)),
         "nb": len(prix),
         "fenetre_annees": fenetre_dept[(dept, typo)],
-        "fiable": len(prix) >= SEUIL_VENTES_TYPOLOGIE,
+        "fiable": fiable,
+        "marge": round(marge, 3) if marge is not None else None,
     }
 
-# Secteurs : seules les cases FIABLES (>= seuil) sont exportées, pour ne pas
-# alourdir le fichier avec des cases à l'échantillon trop faible (le repli
-# sur la commune/département prend alors le relais côté simulateur).
+# Secteurs : seules les cases FIABLES (plancher + marge) sont exportées, pour
+# ne pas alourdir le fichier avec des cases trop incertaines (le repli sur la
+# commune/département prend alors le relais côté simulateur).
 secteurs = {str(t): {} for t in RESOLUTIONS_SECTEUR}
 nb_secteurs_fiables = 0
+marges_mesurees = []  # pour le diagnostic de dispersion ci-dessous
 for (taille_m, cell, typo), prix in secteurs_prix_typo.items():
-    if len(prix) < SEUIL_VENTES_TYPOLOGIE:
+    fiable, marge, mediane = est_fiable(prix)
+    if not fiable:
         continue
     secteurs[str(taille_m)].setdefault(cell, {})
     secteurs[str(taille_m)][cell][typo] = {
-        "mediane": round(statistics.median(prix)),
+        "mediane": round(mediane),
         "nb": len(prix),
         "fenetre_annees": fenetre_secteurs[(taille_m, cell, typo)],
+        "marge": round(marge, 3),
     }
     nb_secteurs_fiables += 1
+    if len(prix) >= 15:
+        marges_mesurees.append(statistics.stdev(prix) / statistics.mean(prix))
 
 print(
     f"Prix par typologie calculé pour {len(communes_prix_typo)} paires commune/typologie, "
@@ -538,6 +587,30 @@ print(
     f"{nb_secteurs_fiables} paires secteur/typologie fiables sur {len(secteurs_prix_typo)} calculées "
     f"({sum(len(v) for v in secteurs.values())} cases de secteur au total)."
 )
+
+# Diagnostic automatique de dispersion (coefficient de variation) : permet de
+# détecter, mois après mois, une dérive structurelle du marché qui rendrait
+# le plancher/la marge actuels mal calibrés (voir historique du projet pour
+# la simulation ayant servi à les fixer : plancher 15, marge cible 20%).
+if marges_mesurees:
+    cvs_tries = sorted(marges_mesurees)
+    n_cv = len(cvs_tries)
+    mediane_cv = cvs_tries[n_cv // 2]
+    p25_cv = cvs_tries[int(n_cv * 0.25)]
+    p75_cv = cvs_tries[int(n_cv * 0.75)]
+    print(
+        f"Diagnostic dispersion (CV) sur {n_cv} secteurs : "
+        f"médiane={mediane_cv*100:.1f}%, 25e centile={p25_cv*100:.1f}%, 75e centile={p75_cv*100:.1f}%."
+    )
+    # Repère de référence mesuré le 10/09/2026 sur toute la France : médiane ~40%.
+    # Alerte si dérive de plus de 10 points par rapport à cette référence.
+    REFERENCE_MEDIANE_CV = 0.401
+    if abs(mediane_cv - REFERENCE_MEDIANE_CV) > 0.10:
+        print(
+            f"⚠️  ATTENTION : la dispersion médiane mesurée ({mediane_cv*100:.1f}%) s'écarte de plus "
+            f"de 10 points de la référence historique ({REFERENCE_MEDIANE_CV*100:.1f}%) - le plancher/la "
+            f"marge cible (PLANCHER_VENTES/MARGE_CIBLE) mériteraient d'être revérifiés."
+        )
 
 # ---------------------------------------------------------------------------
 # 5) Loyer réglementaire encadré (Paris intra-muros uniquement), par quartier
