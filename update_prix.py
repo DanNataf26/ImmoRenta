@@ -22,6 +22,7 @@ import csv
 import datetime
 import gzip
 import json
+import math
 import os
 import statistics
 import urllib.request
@@ -49,6 +50,20 @@ COMMUNE_REFERENCE = "01053"  # Bourg-en-Bresse : sert à identifier les typologi
 SEUIL_VENTES_TYPOLOGIE = 20
 MAX_ANNEES_TYPOLOGIE = 5
 
+# Résolutions de la grille géographique fine (secteur), en mètres, du plus
+# fin au plus large - cascade utilisée par le simulateur au moment de la
+# consultation (300m -> 500m -> 1km -> commune -> département).
+RESOLUTIONS_SECTEUR = [300, 500, 1000]
+REF_LAT_FRANCE = 46.5  # latitude de référence pour la conversion degrés/mètres
+
+
+def grid_id(lat, lon, taille_m):
+    """Identifiant de case de grille (cohérent avec l'équivalent JS côté
+    simulateur - même latitude de référence, mêmes formules)."""
+    lat_deg = taille_m / 111320.0
+    lon_deg = taille_m / (111320.0 * math.cos(math.radians(REF_LAT_FRANCE)))
+    return f"{math.floor(lat / lat_deg)}_{math.floor(lon / lon_deg)}"
+
 
 def url_existe(url):
     try:
@@ -73,10 +88,11 @@ def annees_dvf_disponibles(max_annees=MAX_ANNEES_TYPOLOGIE):
     return trouvees
 
 
-def traiter_annee_dvf_brut(annee, communes_prix, dept_prix, locked_communes, locked_dept):
+def traiter_annee_dvf_brut(annee, communes_prix, dept_prix, locked_communes, locked_dept, secteurs_prix, locked_secteurs):
     """Télécharge et traite une année de DVF brut national, en ne retenant
     que les ventes d'un seul appartement (dépendances tolérées à part), et
-    alimente les compteurs par (commune/département, typologie)."""
+    alimente les compteurs par (commune/département, typologie) ET par
+    secteur géographique fin (300m/500m/1km, typologie)."""
     url = f"https://files.data.gouv.fr/geo-dvf/latest/csv/{annee}/full.csv.gz"
     tmp = f"dvf_full_{annee}.csv.gz"
     print(f"Téléchargement DVF brut national {annee}...")
@@ -104,6 +120,8 @@ def traiter_annee_dvf_brut(annee, communes_prix, dept_prix, locked_communes, loc
                 surface = float(row["surface_reelle_bati"] or 0)
                 valeur = float(row["valeur_fonciere"] or 0)
                 pieces = int(float(row["nombre_pieces_principales"] or 0))
+                lat = float(row["latitude"] or 0)
+                lon = float(row["longitude"] or 0)
             except ValueError:
                 continue
             if surface <= 0 or valeur <= 0 or pieces <= 0:
@@ -124,6 +142,13 @@ def traiter_annee_dvf_brut(annee, communes_prix, dept_prix, locked_communes, loc
                 key_d = (dept, typo)
                 if key_d not in locked_dept:
                     dept_prix[key_d].append(prix_m2)
+
+            if lat and lon:
+                for taille_m in RESOLUTIONS_SECTEUR:
+                    cell = grid_id(lat, lon, taille_m)
+                    key_s = (taille_m, cell, typo)
+                    if key_s not in locked_secteurs:
+                        secteurs_prix[key_s].append(prix_m2)
 
     os.remove(tmp)
 
@@ -408,16 +433,22 @@ print(f"Loyers {millesime_loyers} par typologie intégrés (commune + départeme
 # ---------------------------------------------------------------------------
 communes_prix_typo = defaultdict(list)
 dept_prix_typo = defaultdict(list)
+secteurs_prix_typo = defaultdict(list)  # (taille_m, cell, typo) -> [prix_m2, ...]
 locked_communes = set()
 locked_dept = set()
+locked_secteurs = set()
 fenetre_communes = {}
 fenetre_dept = {}
+fenetre_secteurs = {}
 
 annees_dvf = annees_dvf_disponibles()
 print("Années DVF brutes disponibles utilisées :", annees_dvf)
 
 for i, annee in enumerate(annees_dvf, start=1):
-    traiter_annee_dvf_brut(annee, communes_prix_typo, dept_prix_typo, locked_communes, locked_dept)
+    traiter_annee_dvf_brut(
+        annee, communes_prix_typo, dept_prix_typo, locked_communes, locked_dept,
+        secteurs_prix_typo, locked_secteurs,
+    )
 
     nouveaux_c = 0
     for key, prix in communes_prix_typo.items():
@@ -431,15 +462,24 @@ for i, annee in enumerate(annees_dvf, start=1):
             locked_dept.add(key)
             fenetre_dept[key] = i
             nouveaux_d += 1
+    nouveaux_s = 0
+    for key, prix in secteurs_prix_typo.items():
+        if key not in locked_secteurs and len(prix) >= SEUIL_VENTES_TYPOLOGIE:
+            locked_secteurs.add(key)
+            fenetre_secteurs[key] = i
+            nouveaux_s += 1
     print(
         f"Après {i} an(s) : {len(locked_communes)} paires commune/typologie fiables "
-        f"({nouveaux_c} nouvelles), {len(locked_dept)} départements/typologie fiables."
+        f"({nouveaux_c} nouvelles), {len(locked_dept)} départements/typologie fiables, "
+        f"{len(locked_secteurs)} secteurs/typologie fiables ({nouveaux_s} nouveaux)."
     )
 
 for key in communes_prix_typo:
     fenetre_communes.setdefault(key, len(annees_dvf))
 for key in dept_prix_typo:
     fenetre_dept.setdefault(key, len(annees_dvf))
+for key in secteurs_prix_typo:
+    fenetre_secteurs.setdefault(key, len(annees_dvf))
 
 for (code, typo), prix in communes_prix_typo.items():
     if not prix:
@@ -465,13 +505,32 @@ for (dept, typo), prix in dept_prix_typo.items():
         "fiable": len(prix) >= SEUIL_VENTES_TYPOLOGIE,
     }
 
+# Secteurs : seules les cases FIABLES (>= seuil) sont exportées, pour ne pas
+# alourdir le fichier avec des cases à l'échantillon trop faible (le repli
+# sur la commune/département prend alors le relais côté simulateur).
+secteurs = {str(t): {} for t in RESOLUTIONS_SECTEUR}
+nb_secteurs_fiables = 0
+for (taille_m, cell, typo), prix in secteurs_prix_typo.items():
+    if len(prix) < SEUIL_VENTES_TYPOLOGIE:
+        continue
+    secteurs[str(taille_m)].setdefault(cell, {})
+    secteurs[str(taille_m)][cell][typo] = {
+        "mediane": round(statistics.median(prix)),
+        "nb": len(prix),
+        "fenetre_annees": fenetre_secteurs[(taille_m, cell, typo)],
+    }
+    nb_secteurs_fiables += 1
+
 print(
-    f"Prix par typologie calculé pour {len(communes_prix_typo)} paires commune/typologie "
-    f"et {len(dept_prix_typo)} paires département/typologie."
+    f"Prix par typologie calculé pour {len(communes_prix_typo)} paires commune/typologie, "
+    f"{len(dept_prix_typo)} paires département/typologie, "
+    f"{nb_secteurs_fiables} paires secteur/typologie fiables sur {len(secteurs_prix_typo)} calculées "
+    f"({sum(len(v) for v in secteurs.values())} cases de secteur au total)."
 )
 
 # ---------------------------------------------------------------------------
 result["departements"] = departements
+result["secteurs"] = secteurs
 result["_millesime_loyers"] = millesime_loyers
 
 with open(DEST_JSON, "w", encoding="utf-8") as f:
