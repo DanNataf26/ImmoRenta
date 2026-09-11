@@ -1,0 +1,25 @@
+name: Déploiement automatique sur le VPS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'index.html'
+  workflow_dispatch: {}  # permet aussi un déclenchement manuel depuis l'onglet "Actions"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Déployer via SSH (git pull sur le VPS)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: ${{ secrets.VPS_PORT }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd /home/ubuntu/apps/immorenta/site
+            git fetch origin main
+            git reset --hard origin/main
