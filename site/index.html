@@ -1,0 +1,2651 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Simulateur de rentabilité locative</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; }
+  @media print {
+    .no-print { display: none !important; }
+    * { color: #111111 !important; background: #ffffff !important; border-color: #bbbbbb !important; box-shadow: none !important; }
+    body { background: #ffffff !important; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useEffect, useMemo, useRef, useState } = React;
+
+function ArrowLeftRight({ size = 15 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 3 4 7l4 4" /><path d="M4 7h16" /><path d="M16 21l4-4-4-4" /><path d="M20 17H4" />
+    </svg>
+  );
+}
+
+
+const PRINT_STYLES = `
+@media print {
+  .no-print { display: none !important; }
+  * { color: #111111 !important; background: #ffffff !important; border-color: #bbbbbb !important; box-shadow: none !important; }
+  body { background: #ffffff !important; }
+  .print-break-avoid { break-inside: avoid; }
+}
+`;
+
+const INK = "#0F172A";
+const PAPER = "#F8FAFC";
+const PAPER_DARK = "#EFF6FF";
+const GREEN = "#1E40AF";
+const GREEN_DARK = "#1E3A8A";
+const GOLD = "#B45309";
+const LINE = "#E2E8F0";
+
+function parseNum(v) {
+  const n = parseFloat(String(v).replace(",", "."));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function euro(n) {
+  return n.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " €";
+}
+
+function pct(n) {
+  return n.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " %";
+}
+
+function median(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function tierFor(rn) {
+  if (rn < 2) return { label: "Faible", color: "#B91C1C" };
+  if (rn < 4) return { label: "Modérée", color: "#D97706" };
+  if (rn < 6) return { label: "Correcte", color: "#CA8A04" };
+  if (rn < 8) return { label: "Bonne", color: "#16A34A" };
+  return { label: "Excellente", color: "#15803D" };
+}
+
+function normalizeStr(s) {
+  return (s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function codeToDept(codeInsee) {
+  if (!codeInsee) return null;
+  if (codeInsee.startsWith("97") || codeInsee.startsWith("98")) return codeInsee.slice(0, 3);
+  return codeInsee.slice(0, 2);
+}
+
+// Identique à la version Python (update_prix.py) : même latitude de
+// référence, même formule, pour que les cases de grille correspondent.
+const REF_LAT_FRANCE = 46.5;
+const RESOLUTIONS_SECTEUR = [300, 500, 1000];
+function gridId(lat, lon, tailleM) {
+  const latDeg = tailleM / 111320;
+  const lonDeg = tailleM / (111320 * Math.cos((REF_LAT_FRANCE * Math.PI) / 180));
+  return `${Math.floor(lat / latDeg)}_${Math.floor(lon / lonDeg)}`;
+}
+
+// Test point-dans-polygone (ray casting) pour détecter le quartier
+// administratif parisien correspondant à une adresse (encadrement des loyers).
+function pointDansPolygone(lat, lon, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [loni, lati] = polygon[i];
+    const [lonj, latj] = polygon[j];
+    const intersect =
+      lati > lat !== latj > lat &&
+      lon < ((lonj - loni) * (lat - lati)) / (latj - lati) + loni;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+const EPOQUES_CONSTRUCTION = ["Avant 1946", "1946-1970", "1971-1990", "Apres 1990"];
+
+// Fichier statique généré à partir des Statistiques DVF officielles
+// (data.gouv.fr / Etalab, Licence Ouverte), hébergé par l'utilisateur sur GitHub
+// (raw.githubusercontent.com gère nativement les en-têtes CORS).
+const PRIX_COMMUNES_URL = "https://raw.githubusercontent.com/DanNataf26/IMMO-RENTA/refs/heads/main/prix-communes.json";
+
+const ETATS = [
+  { key: "excellent", label: "Excellent / rénové", coef: 1.08 },
+  { key: "bon", label: "Bon état", coef: 1.0 },
+  { key: "correct", label: "Correct", coef: 0.92 },
+  { key: "a_renover", label: "À rénover", coef: 0.8 },
+];
+
+const EQUIPEMENTS = [
+  { key: "parking", label: "Parking / box", bonus: 0.03, types: ["appartement", "maison", "local"] },
+  { key: "exterieur", label: "Terrasse / balcon", bonus: 0.04, types: ["appartement", "maison"] },
+  { key: "jardin", label: "Jardin", bonus: 0.055, types: ["maison"] },
+  { key: "piscine", label: "Piscine", bonus: 0.045, types: ["maison"] },
+  { key: "cave", label: "Cave", bonus: 0.02, types: ["appartement", "maison"] },
+  { key: "ascenseur", label: "Ascenseur", bonus: 0.02, types: ["local"] },
+  { key: "climatisation", label: "Climatisation", bonus: 0.02, types: ["appartement", "maison", "local"] },
+  { key: "vueDegagee", label: "Vue dégagée / sans vis-à-vis", bonus: 0.03, types: ["appartement", "maison"] },
+];
+
+// Bonus/malus indicatifs sur prix ET loyer selon la classe DPE (D = neutre).
+// "interdit" indique la date à partir de laquelle la location est/sera interdite
+// pour cette classe (loi Climat et Résilience), à titre informatif.
+const DPE_CLASSES = [
+  { key: "A", label: "A", coef: 0.08, interdit: null },
+  { key: "B", label: "B", coef: 0.05, interdit: null },
+  { key: "C", label: "C", coef: 0.02, interdit: null },
+  { key: "D", label: "D", coef: 0, interdit: null },
+  { key: "E", label: "E", coef: -0.03, interdit: "1er janvier 2034" },
+  { key: "F", label: "F", coef: -0.08, interdit: "1er janvier 2028" },
+  { key: "G", label: "G", coef: -0.12, interdit: "1er janvier 2025 (déjà en vigueur)" },
+];
+
+const MEUBLE_BONUS = 0.15; // impacte uniquement le loyer, jamais le prix
+
+// Taux de capitalisation indicatifs (méthode reconnue par la Charte de
+// l'expertise en évaluation immobilière) pour les locaux commerciaux,
+// bureaux et entrepôts/industriel - source : JLL, Qoridor, Trackstone,
+// e-locaux/AFREXIM (voir historique du projet). Fourchettes larges et
+// volontairement indicatives, à ajuster selon la connaissance du secteur.
+const TAUX_CAPITALISATION = {
+  commerce: { n1: "4.5", secondaire: "8.5", label: "Local commercial" },
+  bureau: { n1: "5", secondaire: "8", label: "Bureau" },
+  entrepot: { n1: "7.5", secondaire: "11", label: "Entrepôt / industriel" },
+};
+
+// Pourcentages indicatifs du capital emprunté, selon le type de garantie
+// (fourchettes de marché 2026 : caution 0,3-1,55 %, hypothèque ~2 %, PPD/HLS
+// intermédiaire) — restent modifiables manuellement.
+const TYPES_GARANTIE = [
+  { key: "caution", label: "Caution (Crédit Logement...)", pct: "1" },
+  { key: "hypotheque", label: "Hypothèque conventionnelle", pct: "2" },
+  { key: "ppd", label: "PPD / hypothèque légale spéciale", pct: "1.5" },
+];
+
+function Field({ label, hint, value, onChange, suffix = "€", step = "1", placeholder }) {
+  return (
+    <label className="block">
+      <div className="flex items-baseline justify-between mb-1">
+        <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+          {label}
+        </span>
+        {hint && (
+          <span style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }}>{hint}</span>
+        )}
+      </div>
+      <div
+        className="flex items-center rounded-lg overflow-hidden"
+        style={{ border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+      >
+        <input
+          type="number"
+          inputMode="decimal"
+          step={step}
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full bg-transparent outline-none px-3 py-2"
+          style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.95rem", color: INK }}
+        />
+        <span
+          className="px-3 py-2 select-none"
+          style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.85rem", color: "#64748B", borderLeft: `1px solid ${LINE}` }}
+        >
+          {suffix}
+        </span>
+      </div>
+    </label>
+  );
+}
+
+function TextField({ label, hint, value, onChange, placeholder, onBlur }) {
+  return (
+    <label className="block">
+      <div className="flex items-baseline justify-between mb-1">
+        <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+          {label}
+        </span>
+        {hint && (
+          <span style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }}>{hint}</span>
+        )}
+      </div>
+      <div
+        className="flex items-center rounded-lg overflow-hidden"
+        style={{ border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+      >
+        <input
+          type="text"
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => onChange(e.target.value)}
+          onBlur={onBlur}
+          className="w-full bg-transparent outline-none px-3 py-2"
+          style={{ fontFamily: "Inter", fontSize: "0.9rem", color: INK }}
+        />
+      </div>
+    </label>
+  );
+}
+
+function CheckChip({ label, checked, onChange }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!checked)}
+      className="flex items-center gap-2 rounded-lg px-3 py-2 text-left"
+      style={{
+        border: `1px solid ${checked ? GREEN : LINE}`,
+        background: checked ? "#DBEAFE" : "#FFFFFF",
+      }}
+    >
+      <span
+        className="inline-flex items-center justify-center rounded-lg shrink-0"
+        style={{
+          width: 14,
+          height: 14,
+          border: `1px solid ${checked ? GREEN : LINE}`,
+          background: checked ? GREEN : "transparent",
+        }}
+      >
+        {checked && (
+          <span style={{ width: 6, height: 6, background: "#FFFFFF", borderRadius: 1 }} />
+        )}
+      </span>
+      <span style={{ fontFamily: "Inter", fontSize: "0.78rem", color: INK }}>{label}</span>
+    </button>
+  );
+}
+
+function ChevronDown({ size = 18, style }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" style={style}>
+      <path d="m6 9 6 6 6-6" />
+    </svg>
+  );
+}
+
+function Accordion({ title, subtitle, isOpen, onToggle, children }) {
+  return (
+    <section className="overflow-hidden" style={{ background: "#FFFFFF", border: `1px solid ${LINE}`, borderRadius: 12, boxShadow: "0 1px 2px rgba(15,23,42,0.04)" }}>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="w-full flex items-center justify-between px-5 py-4 text-left"
+      >
+        <span className="flex items-baseline gap-2">
+          <span style={{ fontFamily: "Inter", color: GREEN_DARK }} className="text-lg">
+            {title}
+          </span>
+          {subtitle && (
+            <span style={{ fontFamily: "Inter", fontSize: "0.72rem", color: "#64748B" }}>
+              {subtitle}
+            </span>
+          )}
+        </span>
+        <ChevronDown
+          style={{
+            color: GREEN_DARK,
+            transform: isOpen ? "rotate(180deg)" : "rotate(0deg)",
+            transition: "transform 0.2s",
+            flexShrink: 0,
+          }}
+        />
+      </button>
+      {isOpen && (
+        <div className="px-5 pb-5 space-y-4" style={{ borderTop: `1px solid ${LINE}`, paddingTop: "1rem" }}>
+          {children}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function LedgerRow({ label, value, subtle, strong }) {
+  return (
+    <div className="flex items-baseline gap-2 py-1">
+      <span
+        style={{
+          fontFamily: "Inter",
+          fontSize: "0.8rem",
+          color: strong ? INK : "#334155",
+          fontWeight: strong ? 600 : 400,
+          whiteSpace: "nowrap",
+        }}
+      >
+        {label}
+      </span>
+      <span
+        className="flex-1 border-b"
+        style={{ borderColor: LINE, transform: "translateY(-3px)" }}
+      />
+      <span
+        style={{
+          fontFamily: "Inter",
+          fontVariantNumeric: "tabular-nums",
+          fontSize: "0.85rem",
+          color: subtle ? "#64748B" : INK,
+          fontWeight: strong ? 600 : 400,
+        }}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function Simulateur() {
+  const [adresse, setAdresse] = useState("");
+  const [addressSuggestions, setAddressSuggestions] = useState([]);
+  const [addressLoading, setAddressLoading] = useState(false);
+  const [addressSelected, setAddressSelected] = useState(false);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const addressDebounceRef = useRef(null);
+  const [loyerRefInfo, setLoyerRefInfo] = useState(null);
+  const [loyerRefLoading, setLoyerRefLoading] = useState(false);
+  const [loyerRefError, setLoyerRefError] = useState(null);
+  const [prixRefInfo, setPrixRefInfo] = useState(null);
+  const [prixRefLoading, setPrixRefLoading] = useState(false);
+  const [prixRefError, setPrixRefError] = useState(null);
+  const [vacanceRefInfo, setVacanceRefInfo] = useState(null);
+  const [vacanceRefError, setVacanceRefError] = useState(null);
+  const [vacanceEstimee, setVacanceEstimee] = useState("");
+  const prixCommunesCacheRef = useRef(null);
+  const [diagnosticDispersion, setDiagnosticDispersion] = useState(null);
+  const [surface, setSurface] = useState("");
+  const [pieces, setPieces] = useState("");
+  const [departementKey, setDepartementKey] = useState("");
+  const [departementsListe, setDepartementsListe] = useState([]);
+
+  useEffect(() => {
+    fetch(PRIX_COMMUNES_URL)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!data) return;
+        prixCommunesCacheRef.current = data;
+        if (data._diagnostic_dispersion) setDiagnosticDispersion(data._diagnostic_dispersion);
+        const liste = Object.entries(data.departements || {})
+          .map(([code, entry]) => ({ code, nom: entry.nom }))
+          .sort((a, b) => a.code.localeCompare(b.code));
+        setDepartementsListe(liste);
+        if (liste.length > 0) setDepartementKey((k) => k || liste[0].code);
+      })
+      .catch(() => {});
+  }, []);
+  const [prixM2, setPrixM2] = useState("");
+  const [loyerM2, setLoyerM2] = useState("");
+  const [etat, setEtat] = useState("bon");
+  const [dpe, setDpe] = useState("");
+  const [etage, setEtage] = useState("");
+  const [dernierEtage, setDernierEtage] = useState(false);
+  const [jardinPrivatif, setJardinPrivatif] = useState(false);
+  const [meuble, setMeuble] = useState(false);
+  const [typeBien, setTypeBien] = useState("appartement"); // "appartement" | "maison" | "local"
+  const [sousTypeLocal, setSousTypeLocal] = useState("commerce"); // "commerce" | "bureau" | "entrepot"
+  const [emplacementLocal, setEmplacementLocal] = useState("secondaire"); // "n1" | "secondaire"
+  const [modePrixLocal, setModePrixLocal] = useState("comparaison"); // "comparaison" | "capitalisation"
+  const [loyerAnnuelLocal, setLoyerAnnuelLocal] = useState("");
+  const [tauxCapitalisation, setTauxCapitalisation] = useState("8.5");
+  const [lastCodeInsee, setLastCodeInsee] = useState(null);
+  const [addressCoords, setAddressCoords] = useState(null);
+  const [quartierParis, setQuartierParis] = useState(null); // { id, nom } ou null
+  const [epoqueConstruction, setEpoqueConstruction] = useState("");
+  const [modeLoyer, setModeLoyer] = useState("marche"); // "marche" | "reglementaire"
+  const [equipements, setEquipements] = useState({ parking: false, exterieur: false, cave: false, ascenseur: false });
+
+  const [prix, setPrix] = useState("");
+  const [prixMode, setPrixMode] = useState("prix"); // "prix" | "rentabilite"
+  const [targetNette, setTargetNette] = useState("");
+  const [targetNetteExact, setTargetNetteExact] = useState(null);
+  const [fraisAgencePct, setFraisAgencePct] = useState("3");
+  const [fraisAgenceMode, setFraisAgenceMode] = useState("pct"); // "pct" | "montant"
+  const [fraisAgenceCharge, setFraisAgenceCharge] = useState("acquereur");
+  const [notairePct, setNotairePct] = useState("7.5");
+  const [typeAchat, setTypeAchat] = useState("ancien"); // "ancien" | "neuf"
+  const [fraisGarantiePct, setFraisGarantiePct] = useState("1");
+  const [typeGarantie, setTypeGarantie] = useState(""); // "" | "caution" | "hypotheque" | "ppd"
+  const [fraisGarantieMode, setFraisGarantieMode] = useState("pct"); // "pct" | "montant"
+  const [fraisDossierPct, setFraisDossierPct] = useState("1");
+  const [fraisDossierMode, setFraisDossierMode] = useState("pct"); // "pct" | "montant"
+  const [travaux, setTravaux] = useState("");
+  const [revenus, setRevenus] = useState("");
+  const [revenusMode, setRevenusMode] = useState("annuel"); // "annuel" | "mensuel"
+  const [charges, setCharges] = useState("");
+  const [taxeFonciere, setTaxeFonciere] = useState("");
+  const [tauxVacance, setTauxVacance] = useState("");
+
+  const [apport, setApport] = useState("");
+  const [tauxMode, setTauxMode] = useState("detail"); // "detail" | "global"
+  const [tauxInteret, setTauxInteret] = useState("3.5");
+  const [dureeAnnees, setDureeAnnees] = useState("20");
+  const [tauxAssurance, setTauxAssurance] = useState("0.35");
+  const [tauxGlobal, setTauxGlobal] = useState("");
+
+  const [modeUtilisateur, setModeUtilisateur] = useState(() => {
+    try {
+      return localStorage.getItem("simulateur_mode") || "particulier";
+    } catch {
+      return "particulier";
+    }
+  });
+  const definirMode = (nouveau) => {
+    setModeUtilisateur(nouveau);
+    try {
+      localStorage.setItem("simulateur_mode", nouveau);
+    } catch {}
+  };
+
+  const [openSections, setOpenSections] = useState({
+    evaluation: false,
+    acquisition: false,
+    exploitation: false,
+    financement: false,
+  });
+  const toggleSection = (key) =>
+    setOpenSections((o) => ({ ...o, [key]: !o[key] }));
+
+  const estimation = useMemo(() => {
+    const s = parseNum(surface);
+    const pm2 = parseNum(prixM2);
+    const loyM2 = parseNum(loyerM2);
+    const etatObj = ETATS.find((e) => e.key === etat) || ETATS[1];
+    const bonusEquip = EQUIPEMENTS.filter((e) => e.types.includes(typeBien)).reduce(
+      (sum, e) => sum + (equipements[e.key] ? e.bonus : 0),
+      0
+    );
+    const dpeObj = DPE_CLASSES.find((d) => d.key === dpe);
+    const coefDpe = dpeObj ? dpeObj.coef : 0;
+    const bonusMeuble = meuble && typeBien !== "local" ? MEUBLE_BONUS : 0;
+
+    // Coefficient étage : appartements uniquement, impacte le PRIX seulement
+    // (convention de marché, pas de donnée officielle chiffrée par commune).
+    let coefEtage = 0;
+    if (typeBien === "appartement" && etage !== "") {
+      const e = parseNum(etage);
+      const ascHere = !!equipements.ascenseur;
+      if (e === 0) {
+        coefEtage = jardinPrivatif ? 0.05 : -0.07; // RDC avec jardin privatif : bonus ; sans : décote
+      } else if (e >= 4 && !ascHere) {
+        coefEtage = -0.02 * (e - 3); // étages élevés sans ascenseur : décote croissante
+      }
+      if (dernierEtage && ascHere) {
+        coefEtage += 0.07; // dernier étage avec ascenseur : bonus
+      }
+    }
+
+    const prixParComparaison =
+      s > 0 && pm2 > 0 ? s * pm2 * etatObj.coef * (1 + bonusEquip + coefDpe + coefEtage) : 0;
+    const loyerAnnuelLocalNum = parseNum(loyerAnnuelLocal);
+    const tauxCapNum = parseNum(tauxCapitalisation);
+    const prixParCapitalisation =
+      loyerAnnuelLocalNum > 0 && tauxCapNum > 0 ? loyerAnnuelLocalNum / (tauxCapNum / 100) : 0;
+    const utiliseCapitalisation = typeBien === "local" && modePrixLocal === "capitalisation";
+    const prixEstime = utiliseCapitalisation ? prixParCapitalisation : prixParComparaison;
+    const loyerMensuelEstime =
+      s > 0 && loyM2 > 0 ? s * loyM2 * etatObj.coef * (1 + bonusEquip + coefDpe + bonusMeuble) : 0;
+    const loyerAnnuelEstime = loyerMensuelEstime * 12;
+    return {
+      prixEstime,
+      loyerAnnuelEstime,
+      loyerMensuelEstime,
+      coefEtat: etatObj.coef,
+      bonusEquip,
+      coefDpe,
+      bonusMeuble,
+      coefEtage,
+      utiliseCapitalisation,
+      prixParComparaison,
+    };
+  }, [
+    surface, prixM2, loyerM2, etat, equipements, dpe, meuble, typeBien, etage, dernierEtage,
+    jardinPrivatif, modePrixLocal, loyerAnnuelLocal, tauxCapitalisation,
+  ]);
+
+  useEffect(() => {
+    if (addressSelected) return;
+    if (adresse.trim().length < 3) {
+      setAddressSuggestions([]);
+      setShowSuggestions(false);
+      return;
+    }
+    if (addressDebounceRef.current) clearTimeout(addressDebounceRef.current);
+    addressDebounceRef.current = setTimeout(() => {
+      setAddressLoading(true);
+      fetch(
+        `https://data.geopf.fr/geocodage/search?q=${encodeURIComponent(adresse)}&limit=5&index=address`
+      )
+        .then((r) => r.json())
+        .then((data) => {
+          setAddressSuggestions(data.features || []);
+          setShowSuggestions(true);
+        })
+        .catch(() => {
+          setAddressSuggestions([]);
+        })
+        .finally(() => setAddressLoading(false));
+    }, 300);
+    return () => clearTimeout(addressDebounceRef.current);
+  }, [adresse, addressSelected]);
+
+  const handleAddressChange = (val) => {
+    setAdresse(val);
+    setAddressSelected(false);
+    setLoyerRefInfo(null);
+    setLoyerRefError(null);
+    setPrixRefInfo(null);
+    setPrixRefError(null);
+    setVacanceRefInfo(null);
+    setVacanceRefError(null);
+    setVacanceEstimee("");
+  };
+
+  const fetchLoyerReference = (codeInsee) => {
+    if (typeBien === "local") {
+      setLoyerRefLoading(false);
+      setLoyerM2("");
+      setLoyerRefInfo(null);
+      setLoyerRefError(
+        "La Carte des loyers ne couvre que le logement résidentiel (appartements/maisons) : pas de loyer de référence disponible pour cette catégorie (locaux commerciaux/bureaux/industriels). À estimer manuellement."
+      );
+      return;
+    }
+
+    if (modeLoyer === "reglementaire" && quartierParis && typeBien === "appartement") {
+      setLoyerRefLoading(false);
+      const data = prixCommunesCacheRef.current;
+      const nbP = parseNum(pieces);
+      const pieceKey = nbP > 0 ? String(Math.min(Math.round(nbP), 4)) : null;
+      const table = data && data.paris_encadrement && data.paris_encadrement.loyers[quartierParis.id];
+      const valeurs = table && pieceKey ? table[pieceKey] && table[pieceKey][epoqueConstruction] : null;
+      if (!pieceKey || !epoqueConstruction) {
+        setLoyerM2("");
+        setLoyerRefInfo(null);
+        setLoyerRefError("Renseignez le nombre de pièces et l'époque de construction pour le loyer réglementaire.");
+        return;
+      }
+      if (!valeurs) {
+        setLoyerM2("");
+        setLoyerRefInfo(null);
+        setLoyerRefError("Aucune donnée d'encadrement pour cette combinaison pièces/époque dans ce quartier.");
+        return;
+      }
+      setLoyerM2(String(valeurs.ref));
+      setLoyerRefInfo({
+        commune: quartierParis.nom,
+        typo: "réglementaire",
+        valeur: valeurs.ref,
+        reglementaire: { min: valeurs.min, max: valeurs.max, annee: data.paris_encadrement.annee },
+      });
+      return;
+    }
+
+    setLoyerRefLoading(true);
+    setLoyerRefError(null);
+
+    const nbPieces = parseNum(pieces);
+
+    const lookup = (data) => {
+      const entry = data[codeInsee];
+      const loyers = entry && entry.loyer;
+      if (!loyers) {
+        setLoyerM2("");
+        setLoyerRefInfo(null);
+        setLoyerRefError(
+          `Aucune donnée de loyer officielle disponible pour les ${typeBien === "maison" ? "maisons" : "appartements"} de cette commune.`
+        );
+        return;
+      }
+
+      let typo, typoLabel;
+      if (typeBien === "maison") {
+        typo = loyers.maison;
+        typoLabel = "maison type";
+      } else if (typeBien === "immeuble") {
+        typo = loyers.toutes;
+        typoLabel = "appartement toutes typologies (approximation, moyenne des logements de l'immeuble)";
+      } else if (nbPieces > 0 && nbPieces <= 2 && loyers.t1t2 != null) {
+        typo = loyers.t1t2;
+        typoLabel = "appartement T1-T2 (petite typologie)";
+      } else if (nbPieces >= 3 && loyers.t3plus != null) {
+        typo = loyers.t3plus;
+        typoLabel = "appartement T3 et plus (grande typologie)";
+      } else {
+        typo = loyers.toutes;
+        typoLabel = "appartement toutes typologies confondues";
+      }
+
+      if (!typo || typo.valeur == null) {
+        setLoyerM2("");
+        setLoyerRefInfo(null);
+        setLoyerRefError(
+          `Aucune donnée de loyer officielle disponible pour cette typologie dans cette commune.`
+        );
+        return;
+      }
+
+      setLoyerM2(String(typo.valeur));
+      setLoyerRefInfo({
+        commune: entry.nom,
+        typo: typoLabel,
+        valeur: typo.valeur,
+        nbObs: typo.nb,
+        r2: typo.r2,
+        fiable: (typo.nb || 0) >= 30 && (typo.r2 || 0) >= 0.5,
+      });
+    };
+
+    if (prixCommunesCacheRef.current) {
+      lookup(prixCommunesCacheRef.current);
+      setLoyerRefLoading(false);
+      return;
+    }
+
+    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(PRIX_COMMUNES_URL)}`;
+
+    fetch(PRIX_COMMUNES_URL)
+      .then((r) => {
+        if (!r.ok) throw new Error("échec requête directe");
+        return r.json();
+      })
+      .then((data) => {
+        prixCommunesCacheRef.current = data;
+        lookup(data);
+      })
+      .catch(() => {
+        return fetch(proxyUrl)
+          .then((r) => {
+            if (!r.ok) throw new Error("échec requête proxy");
+            return r.json();
+          })
+          .then((data) => {
+            prixCommunesCacheRef.current = data;
+            lookup(data);
+          })
+          .catch(() => {
+            setLoyerRefInfo(null);
+            setLoyerRefError("Fichier de loyer par commune momentanément indisponible.");
+          });
+      })
+      .finally(() => setLoyerRefLoading(false));
+  };
+
+  const fetchPrixReference = (codeInsee) => {
+    setPrixRefLoading(true);
+    setPrixRefError(null);
+
+    const lookup = (data) => {
+      // Détection du quartier administratif parisien (encadrement des loyers),
+      // indépendante du reste - n'a d'effet que si l'adresse tombe dans Paris.
+      if (addressCoords && data.paris_encadrement && data.paris_encadrement.quartiers) {
+        let trouve = null;
+        for (const [qid, q] of Object.entries(data.paris_encadrement.quartiers)) {
+          if (pointDansPolygone(addressCoords.lat, addressCoords.lon, q.polygon)) {
+            trouve = { id: qid, nom: q.nom };
+            break;
+          }
+        }
+        setQuartierParis(trouve);
+        if (!trouve) setModeLoyer("marche");
+      } else {
+        setQuartierParis(null);
+        setModeLoyer("marche");
+      }
+
+      const entry = data[codeInsee];
+      if (!entry) {
+        setPrixRefInfo(null);
+        setPrixRefError("Aucune donnée DVF trouvée pour cette commune (code " + codeInsee + ").");
+        setVacanceRefInfo(null);
+        setVacanceRefError(null);
+        setVacanceEstimee("");
+        return;
+      }
+
+      if (typeBien === "local") {
+        setVacanceEstimee("");
+        setVacanceRefInfo(null);
+        setVacanceRefError(
+          "LOVAC ne couvre que le logement résidentiel : pas de taux de vacance de référence disponible pour cette catégorie (locaux commerciaux/bureaux/industriels). À estimer manuellement."
+        );
+      } else if (entry.vacance) {
+        setVacanceEstimee(String(entry.vacance.taux));
+        setVacanceRefInfo({ commune: entry.nom, taux: entry.vacance.taux, millesime: entry.vacance.millesime, mixte: true });
+        setVacanceRefError(null);
+      } else {
+        setVacanceEstimee("");
+        setVacanceRefInfo(null);
+        setVacanceRefError("Aucune donnée de vacance disponible pour cette commune (LOVAC).");
+      }
+
+      const nbPieces = parseNum(pieces);
+      let source, typeUtilise, fiabiliteTypo = null, niveauUtilise = null;
+      const typoKey = nbPieces > 0 ? (nbPieces <= 2 ? "t1t2" : "t3plus") : null;
+
+      // 1) Secteur géographique fin (300m -> 500m -> 1km), + typologie
+      if (typeBien === "appartement" && typoKey && addressCoords && data.secteurs) {
+        for (const taille of RESOLUTIONS_SECTEUR) {
+          const cell = gridId(addressCoords.lat, addressCoords.lon, taille);
+          const secteur = data.secteurs[String(taille)] && data.secteurs[String(taille)][cell];
+          const typo = secteur && secteur[typoKey];
+          if (typo) {
+            source = { nb: typo.nb, mediane: typo.mediane, moyenne: null };
+            typeUtilise = (typoKey === "t1t2" ? "appartements T1-T2" : "appartements T3 et plus") + ` (secteur ${taille}m)`;
+            fiabiliteTypo = { fiable: true, fenetreAnnees: typo.fenetre_annees, marge: typo.marge };
+            niveauUtilise = "secteur";
+            break;
+          }
+        }
+      }
+
+      // 1bis) Secteur géographique fin pour les maisons (pas de typologie)
+      if (!source && typeBien === "maison" && addressCoords && data.secteurs) {
+        for (const taille of RESOLUTIONS_SECTEUR) {
+          const cell = gridId(addressCoords.lat, addressCoords.lon, taille);
+          const secteur = data.secteurs[String(taille)] && data.secteurs[String(taille)][cell];
+          const typo = secteur && secteur["maison"];
+          if (typo) {
+            source = { nb: typo.nb, mediane: typo.mediane, moyenne: null };
+            typeUtilise = `maisons (secteur ${taille}m)`;
+            fiabiliteTypo = { fiable: true, fenetreAnnees: typo.fenetre_annees, marge: typo.marge };
+            niveauUtilise = "secteur";
+            break;
+          }
+        }
+      }
+
+      // 1ter) Secteur géographique fin pour les immeubles (pas de typologie)
+      if (!source && typeBien === "immeuble" && addressCoords && data.secteurs) {
+        for (const taille of RESOLUTIONS_SECTEUR) {
+          const cell = gridId(addressCoords.lat, addressCoords.lon, taille);
+          const secteur = data.secteurs[String(taille)] && data.secteurs[String(taille)][cell];
+          const typo = secteur && secteur["immeuble"];
+          if (typo) {
+            source = { nb: typo.nb, mediane: typo.mediane, moyenne: null };
+            typeUtilise = `immeubles (secteur ${taille}m)`;
+            fiabiliteTypo = { fiable: true, fenetreAnnees: typo.fenetre_annees, marge: typo.marge };
+            niveauUtilise = "secteur";
+            break;
+          }
+        }
+      }
+
+      // 2) Commune + typologie
+      if (!source && typeBien === "appartement" && typoKey && entry.appartement_typologie) {
+        const typo = entry.appartement_typologie[typoKey];
+        if (typo) {
+          source = { nb: typo.nb, mediane: typo.mediane, moyenne: null };
+          typeUtilise = typoKey === "t1t2" ? "appartements T1-T2" : "appartements T3 et plus";
+          fiabiliteTypo = { fiable: typo.fiable, fenetreAnnees: typo.fenetre_annees, marge: typo.marge };
+          niveauUtilise = "commune";
+        }
+      }
+
+      // 2bis) Commune pour les immeubles (pas de typologie, pas de fusion -
+      // aucune autre source n'existe pour cette catégorie)
+      if (!source && typeBien === "immeuble" && entry.immeuble) {
+        const typo = entry.immeuble;
+        source = { nb: typo.nb, mediane: typo.mediane, moyenne: null };
+        typeUtilise = "immeubles (commune)";
+        fiabiliteTypo = { fiable: typo.fiable, fenetreAnnees: typo.fenetre_annees, marge: typo.marge };
+        niveauUtilise = "commune";
+      }
+
+      // 3) Commune fusionné (toutes typologies) / maison / local
+      if (!source && typeBien !== "immeuble") {
+        source =
+          typeBien === "local"
+            ? entry.local
+            : typeBien === "maison"
+            ? entry.maison || entry.appartement
+            : entry.appartement || entry.maison;
+        if (source) niveauUtilise = niveauUtilise || "commune";
+      }
+
+      // 4) Repli département (typologie, puis fusionné), uniquement si la
+      // commune elle-même n'a rien donné du tout.
+      if (!source && departementKey) {
+        const dept = data.departements && data.departements[departementKey];
+        if (dept) {
+          if (typeBien === "appartement" && typoKey && dept.appartement_typologie && dept.appartement_typologie[typoKey]) {
+            const typo = dept.appartement_typologie[typoKey];
+            source = { nb: typo.nb, mediane: typo.mediane, moyenne: null };
+            typeUtilise = (typoKey === "t1t2" ? "appartements T1-T2" : "appartements T3 et plus") + " (département)";
+            fiabiliteTypo = { fiable: typo.fiable, fenetreAnnees: typo.fenetre_annees, marge: typo.marge };
+          } else if (typeBien === "immeuble" && dept.immeuble) {
+            const typo = dept.immeuble;
+            source = { nb: typo.nb, mediane: typo.mediane, moyenne: null };
+            typeUtilise = "immeubles (département)";
+            fiabiliteTypo = { fiable: typo.fiable, fenetreAnnees: typo.fenetre_annees, marge: typo.marge };
+          } else if (typeBien !== "immeuble") {
+            source =
+              typeBien === "local"
+                ? dept.local
+                : typeBien === "maison"
+                ? dept.maison || dept.appartement
+                : dept.appartement || dept.maison;
+            if (source) {
+              const baseLabel =
+                typeBien === "local"
+                  ? "locaux commerciaux/bureaux/industriels"
+                  : typeBien === "maison"
+                  ? dept.maison
+                    ? "maisons"
+                    : "appartements"
+                  : dept.appartement
+                  ? "appartements (toutes typologies)"
+                  : "maisons";
+              typeUtilise = baseLabel + " (département)";
+            }
+          }
+        }
+      }
+      if (!source) {
+        setPrixRefInfo(null);
+        setPrixRefError(
+          typeBien === "local"
+            ? "Pas assez de ventes de locaux commerciaux/bureaux/industriels enregistrées (DVF) pour cette commune."
+            : typeBien === "immeuble"
+            ? "Pas assez de ventes d'immeubles enregistrées (DVF) pour cette commune ou ce département."
+            : "Pas assez de ventes enregistrées (DVF) pour cette commune."
+        );
+        return;
+      }
+      if (!typeUtilise) {
+        typeUtilise =
+          typeBien === "local"
+            ? "locaux commerciaux/bureaux/industriels"
+            : typeBien === "maison"
+            ? entry.maison
+              ? "maisons"
+              : "appartements"
+            : entry.appartement
+            ? "appartements (toutes typologies)"
+            : "maisons";
+      }
+      setPrixM2(String(source.mediane));
+      setPrixRefInfo({
+        commune: entry.nom,
+        nb: source.nb,
+        moyenne: source.moyenne,
+        mediane: source.mediane,
+        type: typeUtilise,
+        fiabiliteTypo,
+      });
+    };
+
+    if (prixCommunesCacheRef.current) {
+      lookup(prixCommunesCacheRef.current);
+      setPrixRefLoading(false);
+      return;
+    }
+
+    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(PRIX_COMMUNES_URL)}`;
+
+    fetch(PRIX_COMMUNES_URL)
+      .then((r) => {
+        if (!r.ok) throw new Error("échec requête directe");
+        return r.json();
+      })
+      .then((data) => {
+        prixCommunesCacheRef.current = data;
+        lookup(data);
+      })
+      .catch(() => {
+        // Repli via proxy CORS si l'appel direct échoue (en-têtes CORS manquants côté hébergeur)
+        return fetch(proxyUrl)
+          .then((r) => {
+            if (!r.ok) throw new Error("échec requête proxy");
+            return r.json();
+          })
+          .then((data) => {
+            prixCommunesCacheRef.current = data;
+            lookup(data);
+          })
+          .catch(() => {
+            setPrixRefInfo(null);
+            setPrixRefError("Fichier de prix par commune momentanément indisponible (y compris via le relais de secours).");
+          });
+      })
+      .finally(() => setPrixRefLoading(false));
+  };
+
+  const handleSelectAddress = (feature) => {
+    const props = feature.properties || {};
+    setAdresse(props.label || adresse);
+    setAddressSelected(true);
+    setShowSuggestions(false);
+    setAddressSuggestions([]);
+
+    const coords = feature.geometry && feature.geometry.coordinates;
+    if (coords && coords.length === 2) {
+      setAddressCoords({ lat: coords[1], lon: coords[0] });
+    } else {
+      setAddressCoords(null);
+    }
+
+    if (props.citycode) {
+      const deptCode = codeToDept(props.citycode);
+      if (deptCode) setDepartementKey(deptCode);
+      setLastCodeInsee(props.citycode);
+      fetchLoyerReference(props.citycode);
+      fetchPrixReference(props.citycode);
+    }
+  };
+
+  useEffect(() => {
+    if (lastCodeInsee) {
+      fetchLoyerReference(lastCodeInsee);
+      fetchPrixReference(lastCodeInsee);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [typeBien]);
+
+  useEffect(() => {
+    if (lastCodeInsee) {
+      fetchLoyerReference(lastCodeInsee);
+      fetchPrixReference(lastCodeInsee);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pieces]);
+
+  useEffect(() => {
+    if (lastCodeInsee) {
+      fetchLoyerReference(lastCodeInsee);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modeLoyer, epoqueConstruction]);
+
+  useEffect(() => {
+    if (parseNum(loyerAnnuelLocal) > 0) {
+      setModePrixLocal("capitalisation");
+    }
+  }, [loyerAnnuelLocal]);
+
+  const calc = useMemo(() => {
+    const fapct = parseNum(fraisAgencePct);
+    const npct = parseNum(notairePct);
+    const trx = parseNum(travaux);
+    const rev = parseNum(revenus);
+    const chg = parseNum(charges);
+    const tf = parseNum(taxeFonciere);
+    const tvac = parseNum(tauxVacance);
+    const perteVacance = rev * (tvac / 100);
+    const revEffectif = rev - perteVacance;
+    const revenuNetAnnuel = revEffectif - chg - tf;
+
+    // coût total = p * k + trx, où k dépend du régime des frais d'agence
+    // Les frais d'agence s'ajoutent toujours au prix net vendeur ; seule la base
+    // de calcul des frais de notaire diffère selon qui les prend en charge.
+    const k =
+      fraisAgenceCharge === "vendeur"
+        ? (1 + fapct / 100) * (1 + npct / 100)
+        : 1 + fapct / 100 + npct / 100;
+
+    const target = targetNetteExact !== null ? targetNetteExact : parseNum(targetNette);
+    let p;
+    let impossible = false;
+    if (prixMode === "rentabilite") {
+      if (target > 0 && revenuNetAnnuel > 0 && k > 0) {
+        const targetCoutTotal = (revenuNetAnnuel * 100) / target;
+        p = Math.max(0, (targetCoutTotal - trx) / k);
+      } else {
+        p = 0;
+        impossible = true;
+      }
+    } else {
+      p = parseNum(prix);
+    }
+
+    const fa = (p * fapct) / 100;
+    const baseNotaire = fraisAgenceCharge === "vendeur" ? p + fa : p;
+    const fraisNotaire = (baseNotaire * npct) / 100;
+    const coutTotal = p + fa + fraisNotaire + trx;
+
+    const brute = coutTotal > 0 ? (rev / coutTotal) * 100 : 0;
+    const nette = coutTotal > 0 ? (revenuNetAnnuel / coutTotal) * 100 : 0;
+
+    // Financement
+    const ap = parseNum(apport);
+    const duree = parseNum(dureeAnnees);
+    // En mode "taux global", le taux saisi couvre intérêt + assurance et est
+    // appliqué directement dans la formule d'annuité ; l'assurance n'est alors
+    // plus calculée séparément (elle est déjà incluse dans ce taux global).
+    const tauxAnnuel = tauxMode === "global" ? parseNum(tauxGlobal) : parseNum(tauxInteret);
+    const tAssurance = tauxMode === "global" ? 0 : parseNum(tauxAssurance);
+
+    const capitalEmprunte = Math.max(coutTotal - ap, 0);
+    const nMois = Math.max(Math.round(duree * 12), 0);
+    const tauxMensuel = tauxAnnuel / 100 / 12;
+
+    let mensualiteCredit = 0;
+    if (nMois > 0) {
+      mensualiteCredit =
+        tauxMensuel > 0
+          ? (capitalEmprunte * tauxMensuel) / (1 - Math.pow(1 + tauxMensuel, -nMois))
+          : capitalEmprunte / nMois;
+    }
+    const assuranceMensuelle = (capitalEmprunte * tAssurance) / 100 / 12;
+    const mensualiteTotale = mensualiteCredit + assuranceMensuelle;
+    const remboursementAnnuel = mensualiteTotale * 12;
+    const interetsTotaux = mensualiteCredit * nMois - capitalEmprunte;
+    const assuranceTotale = assuranceMensuelle * nMois;
+    const montantGarantie = (capitalEmprunte * parseNum(fraisGarantiePct)) / 100;
+    const montantFraisDossier = (capitalEmprunte * parseNum(fraisDossierPct)) / 100;
+    const coutTotalCredit = interetsTotaux + assuranceTotale + montantGarantie + montantFraisDossier;
+
+    const cashflowAnnuelApresFinancement = revenuNetAnnuel - remboursementAnnuel;
+    const cashflowMensuelApresFinancement = cashflowAnnuelApresFinancement / 12;
+    const rendementFondsPropres = ap > 0 ? (cashflowAnnuelApresFinancement / ap) * 100 : null;
+    const creditRenseigne = ap > 0 && nMois > 0;
+
+    return {
+      p, fa, baseNotaire, fraisNotaire, trx, coutTotal,
+      rev, chg, tf, tvac, perteVacance, revEffectif, revenuNetAnnuel, brute, nette, impossible,
+      cashflowMensuel: revenuNetAnnuel / 12,
+      ap, capitalEmprunte, nMois, mensualiteCredit, assuranceMensuelle, mensualiteTotale,
+      remboursementAnnuel, interetsTotaux, assuranceTotale, montantGarantie, montantFraisDossier, coutTotalCredit,
+      cashflowAnnuelApresFinancement, cashflowMensuelApresFinancement, rendementFondsPropres,
+      creditRenseigne,
+    };
+  }, [
+    prix, prixMode, targetNette, targetNetteExact, fraisAgencePct, fraisAgenceCharge, notairePct,
+    travaux, revenus, charges, taxeFonciere, tauxVacance, apport, tauxMode, tauxInteret, tauxGlobal, dureeAnnees, tauxAssurance,
+    fraisGarantiePct, fraisDossierPct,
+  ]);
+
+  const tier = tierFor(calc.nette);
+
+  useEffect(() => {
+    if (calc.p > 0) {
+      setOpenSections((o) => (o.exploitation ? o : { ...o, exploitation: true }));
+    }
+  }, [calc.p > 0]);
+
+  useEffect(() => {
+    if (calc.creditRenseigne) {
+      setOpenSections((o) => (o.financement ? o : { ...o, financement: true }));
+    }
+  }, [calc.creditRenseigne]);
+
+  // Synchronisation bidirectionnelle prix <-> rentabilité nette visée
+  useEffect(() => {
+    if (prixMode === "rentabilite") {
+      setPrix(calc.p > 0 ? String(Math.round(calc.p)) : "");
+    }
+  }, [calc.p, prixMode]);
+
+  useEffect(() => {
+    if (prixMode === "prix") {
+      if (calc.nette > 0) {
+        setTargetNette(calc.nette.toFixed(2));
+        setTargetNetteExact(calc.nette);
+      } else {
+        setTargetNette("");
+        setTargetNetteExact(null);
+      }
+    }
+  }, [calc.nette, prixMode]);
+
+  const contentRef = useRef(null);
+  const [pdfBusy, setPdfBusy] = useState(false);
+
+  const handleSavePdf = () => {
+    if (typeof window === "undefined" || typeof window.html2pdf === "undefined") {
+      // Solution de repli si html2pdf n'est pas disponible dans cet environnement
+      window.print();
+      return;
+    }
+    setPdfBusy(true);
+    const opt = {
+      margin: 10,
+      filename: "simulateur-rentabilite-locative.pdf",
+      image: { type: "jpeg", quality: 0.98 },
+      html2canvas: {
+        scale: 2,
+        onclone: (doc) => {
+          doc.querySelectorAll(".no-print").forEach((el) => {
+            el.style.display = "none";
+          });
+        },
+      },
+      jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+    };
+    window
+      .html2pdf()
+      .set(opt)
+      .from(contentRef.current)
+      .save()
+      .then(() => {
+        setPdfBusy(false);
+      })
+      .catch(() => {
+        setPdfBusy(false);
+      });
+  };
+
+  return (
+    <div ref={contentRef} style={{ background: PAPER, minHeight: "100vh" }} className="w-full">
+      <style>{PRINT_STYLES}</style>
+      <div className="max-w-5xl mx-auto px-5 py-10 md:py-14">
+        {/* Header */}
+        <div className="no-print flex gap-2 mb-4">
+          <button
+            type="button"
+            onClick={() => definirMode("particulier")}
+            style={{
+              fontFamily: "Inter", fontSize: "0.68rem", fontWeight: 600,
+              padding: "5px 12px", borderRadius: 20, cursor: "pointer",
+              background: modeUtilisateur === "particulier" ? PAPER_DARK : "#F8FAFC",
+              color: modeUtilisateur === "particulier" ? GREEN_DARK : "#64748B",
+              border: modeUtilisateur === "particulier" ? "none" : `1px solid ${LINE}`,
+            }}
+          >
+            Compte particulier
+          </button>
+          <button
+            type="button"
+            onClick={() => definirMode("pro")}
+            style={{
+              fontFamily: "Inter", fontSize: "0.68rem", fontWeight: 600,
+              padding: "5px 12px", borderRadius: 20, cursor: "pointer",
+              background: modeUtilisateur === "pro" ? PAPER_DARK : "#F8FAFC",
+              color: modeUtilisateur === "pro" ? GREEN_DARK : "#64748B",
+              border: modeUtilisateur === "pro" ? "none" : `1px solid ${LINE}`,
+            }}
+          >
+            Compte professionnel
+          </button>
+        </div>
+        <div className="mb-8 md:mb-10 flex items-start justify-between gap-4">
+          <div>
+            <div
+              style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.7rem", letterSpacing: "0.18em", color: GREEN }}
+              className="uppercase mb-2"
+            >
+              Simulateur — investissement locatif
+            </div>
+            <h1
+              style={{ fontFamily: "Inter", fontWeight: 500, color: INK, letterSpacing: "-0.01em" }}
+              className="text-3xl md:text-4xl"
+            >
+              Calcul de rentabilité
+            </h1>
+            <p style={{ fontFamily: "Inter", color: "#334155" }} className="text-sm mt-2 max-w-lg">
+              Renseignez les paramètres d'acquisition, d'exploitation et de financement du bien
+              pour obtenir la rentabilité, le coût du crédit et le cash-flow après financement.
+            </p>
+          </div>
+          <div className="no-print flex gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleSavePdf}
+              disabled={pdfBusy}
+              className="flex items-center justify-center rounded-lg"
+              style={{
+                fontFamily: "Inter",
+                fontSize: "0.7rem",
+                fontWeight: 500,
+                color: "#FFFFFF",
+                background: GREEN_DARK,
+                border: `1px solid ${GREEN}`,
+                opacity: pdfBusy ? 0.7 : 1,
+                padding: "0.4rem 0.75rem",
+                minWidth: 92,
+                textAlign: "center",
+              }}
+            >
+              {pdfBusy ? "Génération…" : "PDF"}
+            </button>
+            <button
+              type="button"
+              onClick={() => window.print()}
+              className="flex items-center justify-center rounded-lg"
+              style={{
+                fontFamily: "Inter",
+                fontSize: "0.7rem",
+                fontWeight: 500,
+                color: GREEN_DARK,
+                background: "#FFFFFF",
+                border: `1px solid ${LINE}`,
+                padding: "0.4rem 0.75rem",
+                minWidth: 92,
+                textAlign: "center",
+              }}
+            >
+              Imprimer
+            </button>
+          </div>
+        </div>
+
+        {diagnosticDispersion && diagnosticDispersion.alerte && (
+          <div
+            className="mb-6 rounded-lg px-4 py-3"
+            style={{ background: "#FBEEDB", border: `1px solid ${GOLD}` }}
+          >
+            <p style={{ fontFamily: "Inter", fontSize: "0.78rem", color: "#334155" }}>
+              ⚠️ <strong>Dispersion des prix inhabituelle ce mois-ci.</strong> La dispersion médiane mesurée
+              sur les secteurs ({Math.round(diagnosticDispersion.mediane_cv * 100)} %) s'écarte de plus de 10
+              points de la référence historique ({Math.round(diagnosticDispersion.reference_cv * 100)} %).
+              Les marges d'erreur affichées restent calculées correctement au cas par cas, mais le réglage
+              général (plancher/marge cible) mériterait d'être revérifié.
+            </p>
+          </div>
+        )}
+
+        <div className="grid md:grid-cols-5 gap-6 md:gap-8">
+          {/* Formulaire */}
+          <div className="md:col-span-3 space-y-6">
+            <Accordion
+              title="Estimation du bien"
+              isOpen={openSections.evaluation}
+              onToggle={() => toggleSection("evaluation")}
+            >
+                <div className="relative">
+                  <TextField
+                    label="Adresse"
+                    hint={addressLoading ? "recherche…" : "facultatif, détecte la région automatiquement"}
+                    value={adresse}
+                    onChange={handleAddressChange}
+                    onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
+                    placeholder="12 rue des Lilas, Lyon"
+                  />
+                  {showSuggestions && addressSuggestions.length > 0 && (
+                    <div
+                      className="absolute left-0 right-0 z-10 rounded-lg overflow-hidden"
+                      style={{ background: "#FFFFFF", border: `1px solid ${LINE}`, marginTop: 2 }}
+                    >
+                      {addressSuggestions.map((feature, i) => (
+                        <button
+                          key={feature.properties.id || i}
+                          type="button"
+                          onClick={() => handleSelectAddress(feature)}
+                          className="w-full text-left px-3 py-2"
+                          style={{
+                            fontFamily: "Inter",
+                            fontSize: "0.8rem",
+                            color: INK,
+                            borderTop: i > 0 ? `1px solid ${LINE}` : "none",
+                            background: "transparent",
+                          }}
+                        >
+                          {feature.properties.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <label className="block">
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      Type de bien
+                    </span>
+                  </div>
+                  <select
+                    value={typeBien}
+                    onChange={(e) => setTypeBien(e.target.value)}
+                    className="w-full rounded-lg px-3 py-2 outline-none"
+                    style={{ fontFamily: "Inter", fontSize: "0.85rem", color: INK, border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                  >
+                    <option value="appartement">Appartement</option>
+                    <option value="maison">Maison</option>
+                    <option value="local">Local commercial / bureau / industriel</option>
+                    <option value="immeuble">Immeuble (plusieurs logements)</option>
+                  </select>
+                  {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                    Détermine quelles données (DVF, Carte des loyers) sont utilisées en priorité pour les prix/loyers de référence.{" "}
+                    {typeBien === "local" && "Pour les locaux commerciaux/bureaux/industriels, DVF ne distinguant pas les sous-types (commerce/bureau/industriel), fortement hétérogènes en prix — un mode de calcul par capitalisation du loyer, plus fidèle à la pratique professionnelle, est proposé ci-dessous en alternative."}
+                    {typeBien === "immeuble" && "Pour les immeubles (ventes groupées de plusieurs logements, 3 lots ou plus), le prix de référence est calculé nous-mêmes à partir des ventes d'immeubles comparables (secteur, commune, puis département) — aucun fichier officiel agrégé n'existant pour cette catégorie, contrairement aux appartements/maisons. Couverture confirmée sur les 97 départements."}
+                  </p>
+)}
+                </label>
+
+                {typeBien === "local" && (
+                  <div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <label className="block">
+                        <div className="flex items-baseline justify-between mb-1">
+                          <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                            Sous-type
+                          </span>
+                        </div>
+                        <select
+                          value={sousTypeLocal}
+                          onChange={(e) => {
+                            setSousTypeLocal(e.target.value);
+                            setTauxCapitalisation(TAUX_CAPITALISATION[e.target.value][emplacementLocal]);
+                          }}
+                          className="w-full rounded-lg px-3 py-2 outline-none"
+                          style={{ fontFamily: "Inter", fontSize: "0.85rem", color: INK, border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                        >
+                          {Object.entries(TAUX_CAPITALISATION).map(([key, v]) => (
+                            <option key={key} value={key}>{v.label}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="block">
+                        <div className="flex items-baseline justify-between mb-1">
+                          <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                            Emplacement
+                          </span>
+                        </div>
+                        <select
+                          value={emplacementLocal}
+                          onChange={(e) => {
+                            setEmplacementLocal(e.target.value);
+                            setTauxCapitalisation(TAUX_CAPITALISATION[sousTypeLocal][e.target.value]);
+                          }}
+                          className="w-full rounded-lg px-3 py-2 outline-none"
+                          style={{ fontFamily: "Inter", fontSize: "0.85rem", color: INK, border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                        >
+                          <option value="n1">N°1 (artère très fréquentée)</option>
+                          <option value="secondaire">Secondaire / périphérique</option>
+                        </select>
+                      </label>
+                    </div>
+
+                    <div className="flex gap-2 mt-3 mb-2">
+                      <button
+                        type="button"
+                        onClick={() => setModePrixLocal("comparaison")}
+                        className="flex-1 rounded-lg py-2"
+                        style={{
+                          fontFamily: "Inter", fontSize: "0.75rem",
+                          border: `1px solid ${LINE}`,
+                          background: modePrixLocal === "comparaison" ? GREEN_DARK : "#FFFFFF",
+                          color: modePrixLocal === "comparaison" ? "#FFFFFF" : INK,
+                        }}
+                      >
+                        Prix par comparaison (DVF)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setModePrixLocal("capitalisation")}
+                        className="flex-1 rounded-lg py-2"
+                        style={{
+                          fontFamily: "Inter", fontSize: "0.75rem",
+                          border: `1px solid ${LINE}`,
+                          background: modePrixLocal === "capitalisation" ? GREEN_DARK : "#FFFFFF",
+                          color: modePrixLocal === "capitalisation" ? "#FFFFFF" : INK,
+                        }}
+                      >
+                        Prix par capitalisation du loyer
+                      </button>
+                    </div>
+
+                    {modePrixLocal === "capitalisation" && (
+                      <>
+                        <div className="grid grid-cols-2 gap-3">
+                          <Field
+                            label="Loyer annuel du local"
+                            hint="loyer réel perçu ou visé, HT/HC"
+                            value={loyerAnnuelLocal}
+                            onChange={setLoyerAnnuelLocal}
+                          />
+                          <Field
+                            label="Taux de capitalisation"
+                            hint="pré-rempli, ajustable"
+                            value={tauxCapitalisation}
+                            onChange={setTauxCapitalisation}
+                            suffix="%"
+                            step="0.1"
+                          />
+                        </div>
+                        {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                          Prix = loyer annuel ÷ taux de capitalisation — méthode reconnue par la Charte de
+                          l'expertise en évaluation immobilière. Taux indicatifs (JLL, Qoridor, Trackstone,
+                          AFREXIM) : à ajuster selon votre connaissance précise du secteur et du bien —
+                          n'intègre ni décote d'occupation, ni qualité du bail, ni solidité du locataire.
+                        </p>
+)}
+                      </>
+                    )}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Surface" value={surface} onChange={setSurface} suffix="m²" />
+                  <Field label="Pièces" value={pieces} onChange={setPieces} suffix="pièces" step="1" />
+                </div>
+
+                <label className="block">
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      Département
+                    </span>
+                  </div>
+                  <select
+                    value={departementKey}
+                    onChange={(e) => setDepartementKey(e.target.value)}
+                    className="w-full rounded-lg px-3 py-2 outline-none"
+                    style={{ fontFamily: "Inter", fontSize: "0.85rem", color: INK, border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                  >
+                    {departementsListe.length === 0 && <option value="">Chargement…</option>}
+                    {departementsListe.map((d) => (
+                      <option key={d.code} value={d.code}>{d.code} — {d.nom}</option>
+                    ))}
+                  </select>
+                  {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                    Sert uniquement d'exemple par défaut (prix/loyer moyens du département, DVF + Carte des
+                    loyers) tant qu'aucune adresse n'a été sélectionnée ci-dessus.
+                  </p>
+)}
+                </label>
+
+                {(prixRefLoading || prixRefError || prixRefInfo) && (
+                  <div
+                    className="rounded-lg px-3 py-2"
+                    style={{ background: "#EFEAE0", border: `1px solid ${LINE}` }}
+                  >
+                    {prixRefLoading && (
+                      <p style={{ fontFamily: "Inter", fontSize: "0.72rem", color: "#334155" }}>
+                        Recherche du prix de référence officiel (DVF) pour cette commune…
+                      </p>
+                    )}
+                    {!prixRefLoading && prixRefError && (
+                      <p style={{ fontFamily: "Inter", fontSize: "0.72rem", color: "#64748B" }}>
+                        {prixRefError}
+                      </p>
+                    )}
+                    {!prixRefLoading && prixRefInfo && (
+                      <p style={{ fontFamily: "Inter", fontSize: "0.72rem", color: "#334155" }}>
+                        Prix de référence pour <strong>{prixRefInfo.commune}</strong> mis à jour ci-dessous —
+                        prix médian <strong>{prixRefInfo.mediane.toLocaleString("fr-FR")} €/m²</strong> sur{" "}
+                        {prixRefInfo.nb} vente{prixRefInfo.nb > 1 ? "s" : ""} de {prixRefInfo.type} enregistrées.{" "}
+                        {prixRefInfo.fiabiliteTypo && (
+                          <>
+                            Calculé sur {prixRefInfo.fiabiliteTypo.fenetreAnnees} an
+                            {prixRefInfo.fiabiliteTypo.fenetreAnnees > 1 ? "s" : ""} de ventes DVF brutes.{" "}
+                            {prixRefInfo.fiabiliteTypo.marge != null ? (
+                              <>
+                                Précision estimée : {Math.round(100 - prixRefInfo.fiabiliteTypo.marge * 100)} % — le
+                                vrai prix médian de cette zone se situe probablement entre{" "}
+                                {Math.round(prixRefInfo.mediane * (1 - prixRefInfo.fiabiliteTypo.marge)).toLocaleString("fr-FR")}{" "}
+                                et{" "}
+                                {Math.round(prixRefInfo.mediane * (1 + prixRefInfo.fiabiliteTypo.marge)).toLocaleString("fr-FR")}{" "}
+                                €/m². Cette fourchette dépend à la fois du nombre de ventes utilisées et de
+                                l'homogénéité réelle des prix dans le secteur (un quartier mêlant biens très
+                                différents donne une fourchette plus large, même à nombre de ventes égal).{" "}
+                              </>
+                            ) : (
+                              !prixRefInfo.fiabiliteTypo.fiable &&
+                              "Échantillon insuffisant pour estimer une précision fiable — à vérifier. "
+                            )}
+                          </>
+                        )}
+                        Source : {prixRefInfo.fiabiliteTypo ? "DVF brut (data.gouv.fr / DGFiP)" : "Statistiques DVF (data.gouv.fr / Etalab, à partir des ventes DGFiP)"}.
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {(loyerRefLoading || loyerRefError || loyerRefInfo) && (
+                  <div
+                    className="rounded-lg px-3 py-2"
+                    style={{ background: "#EFEAE0", border: `1px solid ${LINE}` }}
+                  >
+                    {loyerRefLoading && (
+                      <p style={{ fontFamily: "Inter", fontSize: "0.72rem", color: "#334155" }}>
+                        Recherche du loyer de référence officiel (Carte des loyers) pour cette commune…
+                      </p>
+                    )}
+                    {!loyerRefLoading && loyerRefError && (
+                      <p style={{ fontFamily: "Inter", fontSize: "0.72rem", color: "#64748B" }}>
+                        {loyerRefError}
+                      </p>
+                    )}
+                    {!loyerRefLoading && loyerRefInfo && (
+                      <p style={{ fontFamily: "Inter", fontSize: "0.72rem", color: "#334155" }}>
+                        {loyerRefInfo.reglementaire ? (
+                          <>
+                            Loyer de référence <strong>réglementaire</strong> pour le quartier{" "}
+                            <strong>{loyerRefInfo.commune}</strong> — {euro(loyerRefInfo.valeur)}/m² (fourchette
+                            légale : {euro(loyerRefInfo.reglementaire.min)} à{" "}
+                            {euro(loyerRefInfo.reglementaire.max)}/m²). Encadrement des loyers, Ville de Paris
+                            {loyerRefInfo.reglementaire.annee}, valeur indicative — les références opposables
+                            de l'arrêté préfectoral font foi.
+                          </>
+                        ) : (
+                          <>
+                            Loyer de référence pour <strong>{loyerRefInfo.commune}</strong> mis à jour ci-dessous
+                            — <strong>{loyerRefInfo.typo}</strong> ({euro(loyerRefInfo.valeur)}/m², charges
+                            comprises).{" "}
+                            {!loyerRefInfo.fiable &&
+                              "Fiabilité limitée pour cette commune/typologie (peu d'observations ou modèle peu précis) — à vérifier."}{" "}
+                            Source : Carte des loyers 2025 (ANIL, à partir des données SeLoger/Leboncoin, via
+                            data.gouv.fr).
+                          </>
+                        )}
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {quartierParis && typeBien === "appartement" && (
+                  <div>
+                    <div className="flex gap-2 mb-2">
+                      <button
+                        type="button"
+                        onClick={() => setModeLoyer("marche")}
+                        className="flex-1 rounded-lg py-2"
+                        style={{
+                          fontFamily: "Inter", fontSize: "0.75rem",
+                          border: `1px solid ${LINE}`,
+                          background: modeLoyer === "marche" ? GREEN_DARK : "#FFFFFF",
+                          color: modeLoyer === "marche" ? "#FFFFFF" : INK,
+                        }}
+                      >
+                        Loyer de marché
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setModeLoyer("reglementaire")}
+                        className="flex-1 rounded-lg py-2"
+                        style={{
+                          fontFamily: "Inter", fontSize: "0.75rem",
+                          border: `1px solid ${LINE}`,
+                          background: modeLoyer === "reglementaire" ? GREEN_DARK : "#FFFFFF",
+                          color: modeLoyer === "reglementaire" ? "#FFFFFF" : INK,
+                        }}
+                      >
+                        Loyer réglementaire (Paris)
+                      </button>
+                    </div>
+                    {modeLoyer === "reglementaire" && (
+                      <label className="block">
+                        <div className="flex items-baseline justify-between mb-1">
+                          <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                            Époque de construction
+                          </span>
+                        </div>
+                        <select
+                          value={epoqueConstruction}
+                          onChange={(e) => setEpoqueConstruction(e.target.value)}
+                          className="w-full rounded-lg px-3 py-2 outline-none"
+                          style={{ fontFamily: "Inter", fontSize: "0.85rem", color: INK, border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                        >
+                          <option value="">Sélectionner...</option>
+                          {EPOQUES_CONSTRUCTION.map((e) => (
+                            <option key={e} value={e}>{e.replace("Apres", "Après")}</option>
+                          ))}
+                        </select>
+                        {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                          Quartier détecté : <strong>{quartierParis.nom}</strong>. Nécessaire au calcul du
+                          loyer réglementaire, propre à Paris intra-muros.
+                        </p>
+)}
+                      </label>
+                    )}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-3">
+                  <Field
+                    label="Prix de référence"
+                    hint="par m², facultatif"
+                    value={prixM2}
+                    onChange={setPrixM2}
+                    suffix="€/m²"
+                    placeholder={String(
+                      (() => {
+                        const dept = prixCommunesCacheRef.current?.departements?.[departementKey];
+                        if (!dept) return "";
+                        const nbP = parseNum(pieces);
+                        if (typeBien === "appartement" && nbP > 0 && dept.appartement_typologie) {
+                          const typo = dept.appartement_typologie[nbP <= 2 ? "t1t2" : "t3plus"];
+                          if (typo) return typo.mediane ?? "";
+                        }
+                        if (typeBien === "immeuble") return dept.immeuble?.mediane ?? "";
+                        const source =
+                          typeBien === "local"
+                            ? dept.local
+                            : typeBien === "maison"
+                            ? dept.maison || dept.appartement
+                            : dept.appartement || dept.maison;
+                        return source?.mediane ?? "";
+                      })()
+                    )}
+                  />
+                  <Field
+                    label="Loyer de référence"
+                    hint="par m², facultatif"
+                    value={loyerM2}
+                    onChange={setLoyerM2}
+                    suffix="€/m²"
+                    step="0.5"
+                    placeholder={String(
+                      (() => {
+                        const dept = prixCommunesCacheRef.current?.departements?.[departementKey];
+                        if (!dept || typeBien === "local") return "";
+                        return (typeBien === "maison" ? dept.loyer?.maison : dept.loyer?.toutes) ?? "";
+                      })()
+                    )}
+                  />
+                </div>
+                {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }}>
+                  Le prix ci-dessus est déjà pré-rempli automatiquement à partir de DVF — au niveau le plus
+                  précis disponible pour cette adresse (secteur géographique fin si assez de ventes
+                  comparables à proximité, sinon commune, puis département). Pour consulter vous-même le
+                  détail des ventes individuelles ayant servi au calcul, vous pouvez utiliser{" "}
+                  <a
+                    href="https://app.dvf.etalab.gouv.fr/"
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ color: GREEN_DARK, textDecoration: "underline" }}
+                  >
+                    l'explorateur DVF officiel (Etalab)
+                  </a>{" "}
+                  et ajuster la valeur ci-dessus à la main si besoin. Pour une contre-vérification
+                  indépendante (algorithme propriétaire, non basé sur DVF), vous pouvez aussi consulter{" "}
+                  <a
+                    href="https://www.meilleursagents.com/estimation-immobiliere/"
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ color: GREEN_DARK, textDecoration: "underline" }}
+                  >
+                    l'outil d'estimation de Meilleurs Agents
+                  </a>{" "}
+                  (adresse à ressaisir sur leur site, non pré-remplie).
+                </p>
+)}
+                {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }}>
+                  Les valeurs affichées en transparence sont des exemples indicatifs, non prises en compte tant qu'elles ne sont pas saisies.
+                  Le loyer de référence (par m², mensuel) sert à déduire un loyer probable de la surface (loyer = surface × loyer/m²,
+                  ajusté selon l'état et les équipements) ; il ne tient pas compte des frais, charges, taxe foncière ni du financement —
+                  ceux-ci sont intégrés plus loin dans le calcul de la rentabilité nette. Il est pré-rempli à partir de la Carte des
+                  loyers (ANIL), localisée par commune et par typologie (T1-T2/T3+/maison) — à Paris intra-muros, le loyer réglementaire
+                  encadré peut être utilisé à la place (voir la bascule plus bas).
+                </p>
+)}
+
+                <label className="block">
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      État du bien
+                    </span>
+                  </div>
+                  <select
+                    value={etat}
+                    onChange={(e) => setEtat(e.target.value)}
+                    className="w-full rounded-lg px-3 py-2 outline-none"
+                    style={{ fontFamily: "Inter", fontSize: "0.85rem", color: INK, border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                  >
+                    {ETATS.map((e) => (
+                      <option key={e.key} value={e.key}>{e.label}</option>
+                    ))}
+                  </select>
+                </label>
+
+                <div>
+                  <div className="mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      Équipements
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {EQUIPEMENTS.filter((e) => e.types.includes(typeBien)).map((e) => (
+                      <CheckChip
+                        key={e.key}
+                        label={e.label}
+                        checked={equipements[e.key]}
+                        onChange={(v) => setEquipements((prev) => ({ ...prev, [e.key]: v }))}
+                      />
+                    ))}
+                  </div>
+                </div>
+
+                <label className="block">
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      DPE (diagnostic de performance énergétique)
+                    </span>
+                  </div>
+                  <select
+                    value={dpe}
+                    onChange={(e) => setDpe(e.target.value)}
+                    className="w-full rounded-lg px-3 py-2 outline-none"
+                    style={{ fontFamily: "Inter", fontSize: "0.85rem", color: INK, border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                  >
+                    <option value="">Non renseigné</option>
+                    {DPE_CLASSES.map((d) => (
+                      <option key={d.key} value={d.key}>
+                        {d.label} ({d.coef > 0 ? "+" : ""}{Math.round(d.coef * 100)} % sur prix et loyer)
+                      </option>
+                    ))}
+                  </select>
+                  {(() => {
+                    const dpeObj = DPE_CLASSES.find((d) => d.key === dpe);
+                    if (!dpeObj || !dpeObj.interdit || typeBien === "local") return null;
+                    return (
+                      <p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                        ⚠️ Classe {dpeObj.label} : location interdite à partir du {dpeObj.interdit} — loi n°
+                        2021-1104 du 22 août 2021 (« Climat et Résilience »), art. 160, modifiant l'art. 6 de
+                        la loi n° 89-462 du 6 juillet 1989 (baux d'habitation). Calendrier précisable par
+                        décret : à recouper avec Légifrance en cas de doute.
+                      </p>
+                    );
+                  })()}
+                </label>
+
+                {typeBien !== "local" && (
+                  <CheckChip
+                    label={`Loué meublé (+${Math.round(MEUBLE_BONUS * 100)} % sur le loyer uniquement)`}
+                    checked={meuble}
+                    onChange={setMeuble}
+                  />
+                )}
+
+                {typeBien === "appartement" && (
+                  <div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field
+                        label="Étage"
+                        hint="0 = RDC, facultatif"
+                        value={etage}
+                        onChange={setEtage}
+                        suffix=""
+                        step="1"
+                      />
+                      <div className="flex flex-col justify-end gap-2 pb-1">
+                        <CheckChip
+                          label="Ascenseur"
+                          checked={!!equipements.ascenseur}
+                          onChange={(v) => setEquipements((prev) => ({ ...prev, ascenseur: v }))}
+                        />
+                        <CheckChip
+                          label="Dernier étage"
+                          checked={dernierEtage}
+                          onChange={setDernierEtage}
+                        />
+                      </div>
+                    </div>
+                    {parseNum(etage) === 0 && etage !== "" && (
+                      <div className="mt-2">
+                        <CheckChip
+                          label="Jardin privatif (inverse la décote RDC en bonus)"
+                          checked={jardinPrivatif}
+                          onChange={setJardinPrivatif}
+                        />
+                      </div>
+                    )}
+                    {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                      Impacte le prix estimé uniquement (pas le loyer) — RDC : décote (sauf jardin
+                      privatif : bonus) ; étages élevés sans ascenseur : décote croissante ; dernier étage
+                      avec ascenseur : bonus. Convention de marché usuelle, pas une donnée officielle
+                      chiffrée par commune.
+                    </p>
+)}
+                  </div>
+                )}
+
+                <div className="pt-2" style={{ borderTop: `1px solid ${LINE}` }}>
+                  <LedgerRow
+                    label={estimation.utiliseCapitalisation ? "Prix estimé (par capitalisation)" : "Prix estimé"}
+                    value={euro(estimation.prixEstime)}
+                    strong
+                  />
+                  <LedgerRow label="Loyer mensuel estimé" value={euro(estimation.loyerMensuelEstime)} />
+                  <LedgerRow label="Loyer annuel estimé (hors charges)" value={euro(estimation.loyerAnnuelEstime)} />
+                  {vacanceEstimee !== "" && (
+                    <LedgerRow label="Taux de vacance locative estimé" value={pct(parseNum(vacanceEstimee))} />
+                  )}
+
+                  <label className="block mt-3">
+                    <div className="flex items-baseline justify-between mb-1">
+                      <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                        Taux de vacance locative (estimation)
+                      </span>
+                    </div>
+                    <div className="relative">
+                      <input
+                        type="number"
+                        value={vacanceEstimee}
+                        onChange={(e) => setVacanceEstimee(e.target.value)}
+                        className="w-full rounded-lg px-3 py-2 outline-none"
+                        style={{ fontFamily: "Inter", fontSize: "0.85rem", color: INK, border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                      />
+                      <span
+                        className="absolute right-3 top-1/2 -translate-y-1/2"
+                        style={{ fontFamily: "Inter", fontSize: "0.78rem", color: "#64748B" }}
+                      >
+                        %
+                      </span>
+                    </div>
+                  </label>
+                  {vacanceRefInfo && (
+                    <div
+                      className="rounded-lg px-3 py-2 mt-2"
+                      style={{ background: "#EFEAE0", border: `1px solid ${LINE}` }}
+                    >
+                      <p style={{ fontFamily: "Inter", fontSize: "0.72rem", color: "#334155" }}>
+                        Taux de vacance locative pour <strong>{vacanceRefInfo.commune}</strong> —{" "}
+                        <strong>{pct(vacanceRefInfo.taux)}</strong> du parc privé, tous logements confondus
+                        (millésime {vacanceRefInfo.millesime}) — LOVAC ne distingue pas
+                        appartements/maisons. Source : LOVAC (Cerema / ministère de la Transition écologique,
+                        via data.gouv.fr).
+                      </p>
+                    </div>
+                  )}
+                  {vacanceRefError && (
+                    <div
+                      className="rounded-lg px-3 py-2 mt-2"
+                      style={{ background: "#EFEAE0", border: `1px solid ${LINE}` }}
+                    >
+                      <p style={{ fontFamily: "Inter", fontSize: "0.72rem", color: "#64748B" }}>
+                        {vacanceRefError}
+                      </p>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (estimation.prixEstime > 0) {
+                        setPrixMode("prix");
+                        setPrix(String(Math.round(estimation.prixEstime)));
+                      }
+                      if (estimation.loyerAnnuelEstime > 0) {
+                        setRevenus(String(Math.round(estimation.loyerAnnuelEstime)));
+                      }
+                      if (vacanceEstimee !== "") {
+                        setTauxVacance(vacanceEstimee);
+                      }
+                    }}
+                    className="no-print w-full mt-3 rounded-lg py-2"
+                    style={{ fontFamily: "Inter", fontSize: "0.78rem", fontWeight: 500, color: "#FFFFFF", background: GREEN_DARK }}
+                  >
+                    Utiliser cette estimation dans le simulateur
+                  </button>
+                  {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-2">
+                    Prix, loyer et vacance sont des données réelles par commune (DVF/LOVAC) dès qu'une adresse
+                    a été sélectionnée ci-dessus. Les valeurs par département ne servent que d'exemple par
+                    défaut tant qu'aucune adresse n'a été saisie.
+                  </p>
+)}
+                </div>
+            </Accordion>
+
+            <Accordion
+              title="Acquisition"
+              isOpen={openSections.acquisition}
+              onToggle={() => toggleSection("acquisition")}
+            >
+                <div>
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      {prixMode === "prix" ? "Prix d'acquisition (net vendeur)" : "Rentabilité nette visée"}
+                    </span>
+                    {prixMode === "rentabilite" && (
+                      <span style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }}>
+                        personnalisable
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <div
+                        className="flex items-center rounded-lg overflow-hidden"
+                        style={{ border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                      >
+                        <input
+                          type="number"
+                          inputMode="decimal"
+                          step={prixMode === "prix" ? "1" : "0.1"}
+                          value={prixMode === "prix" ? prix : targetNette}
+                          onChange={(e) => {
+                            if (prixMode === "prix") {
+                              setPrix(e.target.value);
+                            } else {
+                              setTargetNette(e.target.value);
+                              setTargetNetteExact(null);
+                            }
+                          }}
+                          className="w-full bg-transparent outline-none px-3 py-2"
+                          style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.95rem", color: INK }}
+                        />
+                        <span
+                          className="px-3 py-2 select-none"
+                          style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.85rem", color: "#64748B", borderLeft: `1px solid ${LINE}` }}
+                        >
+                          {prixMode === "prix" ? "€" : "%"}
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setPrixMode((m) => (m === "prix" ? "rentabilite" : "prix"))}
+                      title="Basculer entre prix et rentabilité cible"
+                      aria-label="Basculer entre prix et rentabilité cible"
+                      className="no-print flex items-center justify-center rounded-lg shrink-0"
+                      style={{
+                        width: 38,
+                        border: `1px solid ${LINE}`,
+                        background: "#FFFFFF",
+                        color: GREEN_DARK,
+                      }}
+                    >
+                      <ArrowLeftRight size={15} strokeWidth={1.75} />
+                    </button>
+                  </div>
+                  <p style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }} className="mt-1">
+                    {prixMode === "prix"
+                      ? "Saisissez le prix pour en déduire la rentabilité."
+                      : calc.impossible
+                      ? "Renseignez un taux positif et un revenu net annuel positif pour calculer un prix."
+                      : `Prix d'acquisition correspondant : ${euro(calc.p)}`}
+                  </p>
+                  {prixMode === "rentabilite" && (
+                    <div className="no-print mt-3">
+                      <input
+                        type="range"
+                        min="0"
+                        max="15"
+                        step="0.1"
+                        value={targetNette || "0"}
+                        onChange={(e) => {
+                          setTargetNette(e.target.value);
+                          setTargetNetteExact(null);
+                        }}
+                        className="w-full"
+                        style={{ accentColor: GREEN_DARK }}
+                      />
+                      <div className="flex justify-between mt-1">
+                        <span style={{ fontFamily: "Inter", fontSize: "0.65rem", color: "#64748B" }}>0 %</span>
+                        <span style={{ fontFamily: "Inter", fontSize: "0.65rem", color: "#64748B" }}>15 %</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div>
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      Frais d'agence
+                    </span>
+                    <span style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }}>
+                      {fraisAgenceMode === "pct" ? "% du prix net vendeur" : "montant en €"}
+                    </span>
+                  </div>
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <div
+                        className="flex items-center rounded-lg overflow-hidden"
+                        style={{ border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                      >
+                        <input
+                          type="number"
+                          step={fraisAgenceMode === "pct" ? "0.1" : "1"}
+                          value={
+                            fraisAgenceMode === "pct"
+                              ? fraisAgencePct
+                              : Math.round(calc.fa).toString()
+                          }
+                          onChange={(e) => {
+                            if (fraisAgenceMode === "pct") {
+                              setFraisAgencePct(e.target.value);
+                            } else {
+                              const montant = parseNum(e.target.value);
+                              const p = parseNum(prix);
+                              setFraisAgencePct(p > 0 ? String((montant / p) * 100) : "0");
+                            }
+                          }}
+                          className="w-full bg-transparent outline-none px-3 py-2"
+                          style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.95rem", color: INK }}
+                        />
+                        <span
+                          className="px-3 py-2"
+                          style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.85rem", color: "#64748B", borderLeft: `1px solid ${LINE}` }}
+                        >
+                          {fraisAgenceMode === "pct" ? "%" : "€"}
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setFraisAgenceMode((m) => (m === "pct" ? "montant" : "pct"))
+                      }
+                      title="Basculer entre pourcentage et montant"
+                      aria-label="Basculer entre pourcentage et montant"
+                      className="no-print flex items-center justify-center rounded-lg shrink-0"
+                      style={{
+                        width: 38,
+                        border: `1px solid ${LINE}`,
+                        background: "#FFFFFF",
+                        color: GREEN_DARK,
+                      }}
+                    >
+                      <ArrowLeftRight size={15} strokeWidth={1.75} />
+                    </button>
+                    <select
+                      value={fraisAgenceCharge}
+                      onChange={(e) => setFraisAgenceCharge(e.target.value)}
+                      className="rounded-lg px-2 outline-none"
+                      style={{
+                        fontFamily: "Inter",
+                        fontSize: "0.78rem",
+                        color: INK,
+                        border: `1px solid ${LINE}`,
+                        background: "#FFFFFF",
+                      }}
+                    >
+                      <option value="acquereur">Charge acquéreur</option>
+                      <option value="vendeur">Charge vendeur</option>
+                    </select>
+                  </div>
+                  <p style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }} className="mt-1">
+                    {fraisAgenceMode === "pct"
+                      ? `Soit ${euro(calc.fa)}`
+                      : `Soit ${pct(parseNum(fraisAgencePct))}`}
+                    {fraisAgenceCharge === "acquereur"
+                      ? " — s'ajoutent au prix net vendeur ; frais de notaire calculés sur le prix net vendeur seul."
+                      : " — s'ajoutent aussi au prix net vendeur ; frais de notaire calculés sur prix net vendeur + agence."}
+                  </p>
+                </div>
+
+                <label className="block">
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      Type de bien (fiscalité notariale)
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTypeAchat("ancien");
+                        setNotairePct("7.5");
+                      }}
+                      className="rounded-lg py-2"
+                      style={{
+                        fontFamily: "Inter", fontSize: "0.8rem",
+                        border: `1px solid ${LINE}`,
+                        background: typeAchat === "ancien" ? GREEN_DARK : "#FFFFFF",
+                        color: typeAchat === "ancien" ? "#FFFFFF" : INK,
+                      }}
+                    >
+                      Ancien (~7,5 %)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTypeAchat("neuf");
+                        setNotairePct("2.5");
+                      }}
+                      className="rounded-lg py-2"
+                      style={{
+                        fontFamily: "Inter", fontSize: "0.8rem",
+                        border: `1px solid ${LINE}`,
+                        background: typeAchat === "neuf" ? GREEN_DARK : "#FFFFFF",
+                        color: typeAchat === "neuf" ? "#FFFFFF" : INK,
+                      }}
+                    >
+                      Neuf (~2,5 %)
+                    </button>
+                  </div>
+                  {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                    Pré-remplit le taux de frais de notaire ci-dessous selon le régime applicable — reste
+                    modifiable manuellement.
+                  </p>
+)}
+                </label>
+
+                <Field
+                  label="Frais de notaire"
+                  hint={
+                    fraisAgenceCharge === "acquereur"
+                      ? "calculés sur le prix net vendeur"
+                      : "calculés sur prix net vendeur + agence"
+                  }
+                  value={notairePct}
+                  onChange={setNotairePct}
+                  suffix="%"
+                  step="0.1"
+                />
+
+                <Field label="Travaux" hint="rénovation, mise aux normes…" value={travaux} onChange={setTravaux} />
+            </Accordion>
+
+            <Accordion
+              title="Exploitation annuelle"
+              isOpen={openSections.exploitation}
+              onToggle={() => toggleSection("exploitation")}
+            >
+                <div>
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      Revenus locatifs hors charges
+                    </span>
+                    <span style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }}>
+                      {revenusMode === "annuel" ? "loyers annuels encaissés" : "loyer mensuel encaissé"}
+                    </span>
+                  </div>
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <div
+                        className="flex items-center rounded-lg overflow-hidden"
+                        style={{ border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                      >
+                        <input
+                          type="number"
+                          inputMode="decimal"
+                          value={
+                            revenusMode === "annuel"
+                              ? revenus
+                              : revenus
+                              ? String(Math.round((parseNum(revenus) / 12) * 100) / 100)
+                              : ""
+                          }
+                          onChange={(e) => {
+                            if (revenusMode === "annuel") {
+                              setRevenus(e.target.value);
+                            } else {
+                              const mensuel = parseNum(e.target.value);
+                              setRevenus(e.target.value === "" ? "" : String(mensuel * 12));
+                            }
+                          }}
+                          className="w-full bg-transparent outline-none px-3 py-2"
+                          style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.95rem", color: INK }}
+                        />
+                        <span
+                          className="px-3 py-2 select-none"
+                          style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.85rem", color: "#64748B", borderLeft: `1px solid ${LINE}` }}
+                        >
+                          €
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setRevenusMode((m) => (m === "annuel" ? "mensuel" : "annuel"))}
+                      title="Basculer entre annuel et mensuel"
+                      aria-label="Basculer entre annuel et mensuel"
+                      className="no-print flex items-center justify-center rounded-lg shrink-0"
+                      style={{
+                        width: 38,
+                        border: `1px solid ${LINE}`,
+                        background: "#FFFFFF",
+                        color: GREEN_DARK,
+                      }}
+                    >
+                      <ArrowLeftRight size={15} strokeWidth={1.75} />
+                    </button>
+                  </div>
+                  <p style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }} className="mt-1">
+                    {revenus === ""
+                      ? "\u00A0"
+                      : revenusMode === "annuel"
+                      ? `Soit ${euro((parseNum(revenus) / 12))} / mois`
+                      : `Soit ${euro(parseNum(revenus))} / an`}
+                  </p>
+                </div>
+                <Field label="Charges non récupérables" hint="assurance PNO, gestion, quote-part non récupérable de copro…" value={charges} onChange={setCharges} />
+                <Field label="Taxe foncière" value={taxeFonciere} onChange={setTaxeFonciere} />
+                <Field
+                  label="Taux de vacance locative"
+                  hint="part de l'année sans locataire, facultatif — pré-rempli depuis l'estimation si utilisée"
+                  value={tauxVacance}
+                  onChange={setTauxVacance}
+                  suffix="%"
+                  step="0.5"
+                />
+            </Accordion>
+
+            <Accordion
+              title="Financement"
+              isOpen={openSections.financement}
+              onToggle={() => toggleSection("financement")}
+            >
+                <Field label="Apport" hint="fonds propres injectés" value={apport} onChange={setApport} />
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <div className="flex items-baseline justify-between mb-1">
+                      <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                        {tauxMode === "detail" ? "Taux d'intérêt" : "Taux global"}
+                      </span>
+                    </div>
+                    <div className="flex gap-2">
+                      <div className="flex-1">
+                        <div
+                          className="flex items-center rounded-lg overflow-hidden"
+                          style={{ border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                        >
+                          <input
+                            type="number"
+                            inputMode="decimal"
+                            step="0.05"
+                            value={tauxMode === "detail" ? tauxInteret : tauxGlobal}
+                            onChange={(e) =>
+                              tauxMode === "detail" ? setTauxInteret(e.target.value) : setTauxGlobal(e.target.value)
+                            }
+                            className="w-full bg-transparent outline-none px-3 py-2"
+                            style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.95rem", color: INK }}
+                          />
+                          <span
+                            className="px-3 py-2 select-none"
+                            style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.85rem", color: "#64748B", borderLeft: `1px solid ${LINE}` }}
+                          >
+                            %
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setTauxMode((m) => (m === "detail" ? "global" : "detail"))}
+                        title="Basculer entre taux détaillé et taux global"
+                        aria-label="Basculer entre taux détaillé et taux global"
+                        className="no-print flex items-center justify-center rounded-lg shrink-0"
+                        style={{ width: 38, border: `1px solid ${LINE}`, background: "#FFFFFF", color: GREEN_DARK }}
+                      >
+                        <ArrowLeftRight size={15} strokeWidth={1.75} />
+                      </button>
+                    </div>
+                  </div>
+                  <Field label="Durée" value={dureeAnnees} onChange={setDureeAnnees} suffix="ans" step="1" />
+                </div>
+                {tauxMode === "detail" ? (
+                  <Field
+                    label="Taux d'assurance emprunteur"
+                    hint="calculé sur le capital emprunté, par an"
+                    value={tauxAssurance}
+                    onChange={setTauxAssurance}
+                    suffix="%"
+                    step="0.01"
+                  />
+                ) : (
+                  <p style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }}>
+                    Le taux global inclut l'intérêt et l'assurance emprunteur en un seul taux, appliqué directement
+                    dans le calcul de la mensualité — l'assurance n'est alors plus détaillée séparément.
+                  </p>
+                )}
+                <p style={{ fontFamily: "Inter", fontSize: "0.7rem", color: "#64748B" }}>
+                  {calc.creditRenseigne
+                    ? `Capital à emprunter : ${euro(calc.capitalEmprunte)}`
+                    : "Renseignez un apport pour simuler le financement à crédit."}
+                </p>
+
+                <div>
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                      Type de garantie
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    {TYPES_GARANTIE.map((g) => (
+                      <button
+                        key={g.key}
+                        type="button"
+                        onClick={() => {
+                          setTypeGarantie(g.key);
+                          setFraisGarantiePct(g.pct);
+                          setFraisGarantieMode("pct");
+                        }}
+                        className="rounded-lg py-2 px-1"
+                        style={{
+                          fontFamily: "Inter", fontSize: "0.72rem",
+                          border: `1px solid ${LINE}`,
+                          background: typeGarantie === g.key ? GREEN_DARK : "#FFFFFF",
+                          color: typeGarantie === g.key ? "#FFFFFF" : INK,
+                        }}
+                      >
+                        {g.label}
+                      </button>
+                    ))}
+                  </div>
+                  {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                    Pré-remplit le pourcentage indicatif ci-dessous (marché 2026) — reste modifiable
+                    manuellement ; la caution garantit aujourd'hui plus d'un prêt sur deux en France.
+                  </p>
+)}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <div className="flex items-baseline justify-between mb-1">
+                      <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                        Frais de garantie
+                      </span>
+                    </div>
+                    <div className="flex gap-2">
+                      <div className="flex-1">
+                        <div
+                          className="flex items-center rounded-lg overflow-hidden"
+                          style={{ border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                        >
+                          <input
+                            type="number"
+                            step={fraisGarantieMode === "pct" ? "0.1" : "1"}
+                            value={
+                              fraisGarantieMode === "pct"
+                                ? fraisGarantiePct
+                                : Math.round(calc.montantGarantie).toString()
+                            }
+                            onChange={(e) => {
+                              if (fraisGarantieMode === "pct") {
+                                setFraisGarantiePct(e.target.value);
+                              } else {
+                                const montant = parseNum(e.target.value);
+                                const capital = calc.capitalEmprunte;
+                                setFraisGarantiePct(capital > 0 ? String((montant / capital) * 100) : "0");
+                              }
+                            }}
+                            className="w-full bg-transparent outline-none px-3 py-2"
+                            style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.95rem", color: INK }}
+                          />
+                          <span
+                            className="px-3 py-2"
+                            style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.85rem", color: "#64748B", borderLeft: `1px solid ${LINE}` }}
+                          >
+                            {fraisGarantieMode === "pct" ? "%" : "€"}
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setFraisGarantieMode((m) => (m === "pct" ? "montant" : "pct"))}
+                        title="Basculer entre pourcentage et montant"
+                        aria-label="Basculer entre pourcentage et montant"
+                        className="no-print flex items-center justify-center rounded-lg shrink-0"
+                        style={{ width: 38, border: `1px solid ${LINE}`, background: "#FFFFFF", color: GREEN_DARK }}
+                      >
+                        <ArrowLeftRight size={15} strokeWidth={1.75} />
+                      </button>
+                    </div>
+                    {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                      {fraisGarantieMode === "pct"
+                        ? `Soit ${euro(calc.montantGarantie)}`
+                        : `Soit ${pct(parseNum(fraisGarantiePct))} du capital emprunté`}
+                    </p>
+)}
+                  </div>
+                  <div>
+                    <div className="flex items-baseline justify-between mb-1">
+                      <span style={{ fontFamily: "Inter", fontSize: "0.8rem", color: INK, fontWeight: 500 }}>
+                        Frais de dossier
+                      </span>
+                    </div>
+                    <div className="flex gap-2">
+                      <div className="flex-1">
+                        <div
+                          className="flex items-center rounded-lg overflow-hidden"
+                          style={{ border: `1px solid ${LINE}`, background: "#FFFFFF" }}
+                        >
+                          <input
+                            type="number"
+                            step={fraisDossierMode === "pct" ? "0.1" : "1"}
+                            value={
+                              fraisDossierMode === "pct"
+                                ? fraisDossierPct
+                                : Math.round(calc.montantFraisDossier).toString()
+                            }
+                            onChange={(e) => {
+                              if (fraisDossierMode === "pct") {
+                                setFraisDossierPct(e.target.value);
+                              } else {
+                                const montant = parseNum(e.target.value);
+                                const capital = calc.capitalEmprunte;
+                                setFraisDossierPct(capital > 0 ? String((montant / capital) * 100) : "0");
+                              }
+                            }}
+                            className="w-full bg-transparent outline-none px-3 py-2"
+                            style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.95rem", color: INK }}
+                          />
+                          <span
+                            className="px-3 py-2"
+                            style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.85rem", color: "#64748B", borderLeft: `1px solid ${LINE}` }}
+                          >
+                            {fraisDossierMode === "pct" ? "%" : "€"}
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setFraisDossierMode((m) => (m === "pct" ? "montant" : "pct"))}
+                        title="Basculer entre pourcentage et montant"
+                        aria-label="Basculer entre pourcentage et montant"
+                        className="no-print flex items-center justify-center rounded-lg shrink-0"
+                        style={{ width: 38, border: `1px solid ${LINE}`, background: "#FFFFFF", color: GREEN_DARK }}
+                      >
+                        <ArrowLeftRight size={15} strokeWidth={1.75} />
+                      </button>
+                    </div>
+                    {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-1">
+                      {fraisDossierMode === "pct"
+                        ? `Soit ${euro(calc.montantFraisDossier)} — plafond légal : 1 % du capital emprunté (art. R313-7 du Code de la consommation)`
+                        : `Soit ${pct(parseNum(fraisDossierPct))} du capital emprunté`}
+                    </p>
+)}
+                  </div>
+                </div>
+            </Accordion>
+          </div>
+
+          {/* Résultats - relevé de calcul */}
+          <div className="md:col-span-2">
+            <div className="md:sticky md:top-6 space-y-4">
+              {calc.coutTotal <= 0 && (
+                <div
+                  className="p-6"
+                  style={{ background: "#FFFFFF", border: `1px solid ${LINE}`, borderRadius: 12 }}
+                >
+                  <p style={{ fontFamily: "Inter", fontSize: "0.85rem", color: "#334155" }}>
+                    Renseignez le prix d'acquisition (ou une rentabilité visée) pour voir apparaître
+                    la rentabilité, le coût total et le résultat annuel.
+                  </p>
+                </div>
+              )}
+
+              {calc.coutTotal > 0 && (
+                <div
+                  className="p-6"
+                  style={{ background: GREEN_DARK, border: `1px solid ${GREEN}`, borderRadius: 12 }}
+                >
+                  <div
+                    style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.68rem", letterSpacing: "0.16em", color: "#BFDBFE" }}
+                    className="uppercase mb-3"
+                  >
+                    Rentabilité nette de charges
+                  </div>
+                  <div className="flex items-end gap-3 mb-1">
+                    <span
+                      style={{ fontFamily: "Inter", fontWeight: 500, color: "#FFFFFF", fontSize: "3rem", lineHeight: 1 }}
+                    >
+                      {pct(calc.nette)}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 mt-3">
+                    <span
+                      className="inline-block rounded-full"
+                      style={{
+                        fontFamily: "Inter", fontSize: "0.72rem", fontWeight: 600,
+                        padding: "3px 10px",
+                        background: "rgba(255,255,255,0.15)",
+                        color: "#FFFFFF",
+                      }}
+                    >
+                      {tier.label}
+                    </span>
+                    <span style={{ fontFamily: "Inter", fontSize: "0.75rem", color: "#94A3B8" }} className="ml-auto">
+                      Brute : {pct(calc.brute)}
+                    </span>
+                  </div>
+                  <div style={{ height: 3, borderRadius: 2, background: tier.color, marginTop: 10, opacity: 0.9 }} />
+                </div>
+              )}
+
+              {calc.coutTotal > 0 && (
+                <div
+                  className="p-6"
+                  style={{ background: "#FFFFFF", border: `1px solid ${LINE}`, borderRadius: 12 }}
+                >
+                  <h3
+                    style={{ fontFamily: "Inter", color: GREEN_DARK }}
+                    className="text-base mb-3"
+                  >
+                    Coût total de l'investissement
+                  </h3>
+                  <LedgerRow label="Prix net vendeur" value={euro(calc.p)} />
+                  <LedgerRow label="Frais d'agence" value={euro(calc.fa)} />
+                  <LedgerRow label={`Frais de notaire (${parseNum(notairePct)}% sur ${euro(calc.baseNotaire)})`} value={euro(calc.fraisNotaire)} />
+                  <LedgerRow label="Travaux" value={euro(calc.trx)} />
+                  <div className="mt-2 pt-2" style={{ borderTop: `1px solid ${LINE}` }}>
+                    <LedgerRow label="Coût total" value={euro(calc.coutTotal)} strong />
+                  </div>
+                </div>
+              )}
+
+              {calc.coutTotal > 0 && (
+                <div
+                  className="p-6"
+                  style={{ background: "#FFFFFF", border: `1px solid ${LINE}`, borderRadius: 12 }}
+                >
+                  <h3
+                    style={{ fontFamily: "Inter", color: GREEN_DARK }}
+                    className="text-base mb-3"
+                  >
+                    Résultat annuel
+                  </h3>
+                  <LedgerRow label="Revenus locatifs" value={euro(calc.rev)} />
+                  {calc.tvac > 0 && (
+                    <LedgerRow
+                      label={`Perte pour vacance locative (${pct(calc.tvac)})`}
+                      value={"– " + euro(calc.perteVacance)}
+                      subtle
+                    />
+                  )}
+                  <LedgerRow label="Charges non récupérables" value={"– " + euro(calc.chg)} subtle />
+                  <LedgerRow label="Taxe foncière" value={"– " + euro(calc.tf)} subtle />
+                  <div className="mt-2 pt-2" style={{ borderTop: `1px solid ${LINE}` }}>
+                    <LedgerRow label="Revenu net annuel" value={euro(calc.revenuNetAnnuel)} strong />
+                    <LedgerRow label="Cash-flow mensuel" value={euro(calc.cashflowMensuel)} />
+                  </div>
+                  {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-3">
+                    Hors crédit, assurance emprunteur et fiscalité sur les revenus fonciers.
+                  </p>
+)}
+                </div>
+              )}
+
+              {calc.creditRenseigne && (
+                <div
+                  className="p-6"
+                  style={{ background: GREEN_DARK, border: `1px solid ${GREEN}`, borderRadius: 12 }}
+                >
+                  <div
+                    style={{ fontFamily: "Inter", fontVariantNumeric: "tabular-nums", fontSize: "0.68rem", letterSpacing: "0.16em", color: "#BFDBFE" }}
+                    className="uppercase mb-3"
+                  >
+                    Cash-flow mensuel après crédit
+                  </div>
+                  <div className="flex items-end gap-3 mb-1">
+                    <span
+                      style={{
+                        fontFamily: "Inter",
+                        fontWeight: 500,
+                        color: calc.cashflowMensuelApresFinancement >= 0 ? "#FFFFFF" : "#FCA5A5",
+                        fontSize: "3rem",
+                        lineHeight: 1,
+                      }}
+                    >
+                      {euro(calc.cashflowMensuelApresFinancement)}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 mt-3">
+                    <span style={{ fontFamily: "Inter", fontSize: "0.78rem", color: "#CBD5E1" }}>
+                      {calc.rendementFondsPropres === null
+                        ? "Sans apport, non calculable"
+                        : `Rendement sur apport : ${pct(calc.rendementFondsPropres)}`}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {calc.creditRenseigne && (
+                <div
+                  className="p-6"
+                  style={{ background: "#FFFFFF", border: `1px solid ${LINE}`, borderRadius: 12 }}
+                >
+                  <h3
+                    style={{ fontFamily: "Inter", color: GREEN_DARK }}
+                    className="text-base mb-3"
+                  >
+                    Financement
+                  </h3>
+                  <LedgerRow label="Coût total à financer" value={euro(calc.coutTotal)} />
+                  <LedgerRow label="Apport" value={"– " + euro(calc.ap)} subtle />
+                  <LedgerRow label="Capital emprunté" value={euro(calc.capitalEmprunte)} strong />
+                  <div className="mt-2 pt-2" style={{ borderTop: `1px solid ${LINE}` }}>
+                    <LedgerRow
+                      label={tauxMode === "global" ? "Mensualité (taux global)" : "Mensualité crédit"}
+                      value={euro(calc.mensualiteCredit)}
+                    />
+                    {tauxMode === "detail" && (
+                      <LedgerRow label="Assurance emprunteur" value={euro(calc.assuranceMensuelle)} />
+                    )}
+                    <LedgerRow label="Mensualité totale" value={euro(calc.mensualiteTotale)} strong />
+                  </div>
+                  <div className="mt-2 pt-2" style={{ borderTop: `1px solid ${LINE}` }}>
+                    <LedgerRow
+                      label={tauxMode === "global" ? "Coût du crédit (intérêt + assurance)" : "Intérêts sur la durée"}
+                      value={euro(calc.interetsTotaux)}
+                    />
+                    {tauxMode === "detail" && (
+                      <LedgerRow label="Assurance sur la durée" value={euro(calc.assuranceTotale)} />
+                    )}
+                    <LedgerRow label="Frais de garantie (caution/hypothèque)" value={euro(calc.montantGarantie)} />
+                    <LedgerRow label="Frais de dossier" value={euro(calc.montantFraisDossier)} />
+                    <LedgerRow label="Coût total du crédit" value={euro(calc.coutTotalCredit)} strong />
+                  </div>
+                  <div className="mt-2 pt-2" style={{ borderTop: `1px solid ${LINE}` }}>
+                    <LedgerRow label="Revenu net annuel" value={euro(calc.revenuNetAnnuel)} />
+                    <LedgerRow label="Remboursement annuel" value={"– " + euro(calc.remboursementAnnuel)} subtle />
+                    <LedgerRow label="Cash-flow annuel après crédit" value={euro(calc.cashflowAnnuelApresFinancement)} strong />
+                  </div>
+                  {modeUtilisateur === "pro" && (
+<p style={{ fontFamily: "Inter", fontSize: "0.68rem", color: "#64748B" }} className="mt-3">
+                    Hors fiscalité sur les revenus fonciers et évolution de la valeur du bien.
+                  </p>
+)}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Simulateur />);
+</script>
+</body>
+</html>

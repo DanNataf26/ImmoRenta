@@ -1,0 +1,16 @@
+{
+	email {$ACME_EMAIL:internal@example.invalid}
+}
+
+# Si DOMAIN n'est pas défini (ou vaut "localhost"), Caddy sert en HTTP simple
+# sans tenter d'obtenir de certificat Let's Encrypt.
+{$DOMAIN:localhost}
+
+encode gzip
+
+root * /srv
+file_server
+
+# Le simulateur est une page unique : pas de cache long sur l'HTML lui-même
+# (pour recevoir les mises à jour immédiatement), mais gzip suffit ici.
+header /index.html Cache-Control "no-cache"
