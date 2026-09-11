@@ -15,14 +15,16 @@ Simulateur de rentabilité locative.
 - `update_prix.py` — script qui régénère `prix-communes.json` à partir des
   sources officielles (data.gouv.fr). Exécuté automatiquement par
   `.github/workflows/update-prix.yml`.
-- `Dockerfile`, `docker-compose.yml`, `Caddyfile`, `deploy.sh` — de quoi
-  servir `site/index.html` sur un serveur (HTTPS automatique via Caddy si
-  un nom de domaine est configuré).
 
 ## Déploiement
 
-Voir [`DEPLOYMENT.md`](./DEPLOYMENT.md) pour les instructions détaillées
-de déploiement sur un VPS (ex: VPS-4 OVH).
+Ce dépôt ne contient volontairement aucune config de déploiement
+(pas de Dockerfile, pas de reverse proxy) : `site/` est servi tel quel par
+le socle d'hébergement partagé (dépôt `infra-ovh-SDN`, cloné à côté de
+celui-ci sur le serveur sous `~/apps/immorenta`), qui monte ce dossier
+dans un conteneur nginx — voir `projects/immorenta/docker-compose.yml`
+dans `infra-ovh-SDN` pour le détail (port, accès, exposition publique ou
+non).
 
 ## Développement local
 
