@@ -126,36 +126,74 @@ def annees_dvf_disponibles(max_annees=MAX_ANNEES_TYPOLOGIE):
     return trouvees
 
 
-def traiter_annee_dvf_brut(annee, communes_prix, dept_prix, locked_communes, locked_dept, secteurs_prix, locked_secteurs):
+SEUIL_LOTS_IMMEUBLE = 3  # nombre minimum de lots Appartement pour qualifier une vente d'immeuble
+
+
+def traiter_annee_dvf_brut(
+    annee, communes_prix, dept_prix, locked_communes, locked_dept, secteurs_prix, locked_secteurs,
+    communes_prix_immeuble, dept_prix_immeuble, locked_communes_immeuble, locked_dept_immeuble,
+):
     """Télécharge et traite une année de DVF brut national, en ne retenant
     que les ventes d'un seul appartement/maison (dépendances tolérées à part).
     Alimente les compteurs par (commune/département, typologie) pour les
     appartements (T1-T2/T3+), ET par secteur géographique fin (300m/500m/1km)
-    pour les appartements (par typologie) ET les maisons (toutes tailles -
-    la commune/département pour les maisons reste couverte par le fichier
-    DVF agrégé officiel, inutile de la recalculer ici)."""
+    pour les appartements (par typologie), les maisons et les immeubles
+    (toutes tailles - la commune/département pour les maisons reste couverte
+    par le fichier DVF agrégé officiel, inutile de la recalculer ici).
+    Traite aussi, dans les mêmes passes, les ventes d'IMMEUBLES (mutations à
+    plusieurs lots Appartement, >= SEUIL_LOTS_IMMEUBLE), agrégées par
+    mutation (somme des surfaces, valeur unique) - commune/département/
+    secteur, aucune donnée officielle n'existant pour cette catégorie."""
     url = f"https://files.data.gouv.fr/geo-dvf/latest/csv/{annee}/full.csv.gz"
     tmp = f"dvf_full_{annee}.csv.gz"
     print(f"Téléchargement DVF brut national {annee}...")
     urllib.request.urlretrieve(url, tmp)
     print("Téléchargé.")
 
-    # Passe 1 : compter les lots d'habitation par mutation (léger en mémoire)
+    # Passe 1 : compter les lots d'habitation par mutation (léger en mémoire),
+    # et séparément les lots Appartement seuls (pour détecter les immeubles)
     compte = {}
+    compte_appart = {}
     with gzip.open(tmp, "rt", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             if row["type_local"] in ("Appartement", "Maison"):
                 mid = row["id_mutation"]
                 compte[mid] = compte.get(mid, 0) + 1
+            if row["type_local"] == "Appartement":
+                mid = row["id_mutation"]
+                compte_appart[mid] = compte_appart.get(mid, 0) + 1
 
-    # Passe 2 : ne garder que les appartements/maisons en mutation à un seul lot
+    mutations_immeuble = {mid for mid, n in compte_appart.items() if n >= SEUIL_LOTS_IMMEUBLE}
+    del compte_appart
+
+    # Passe 2 : lots individuels (un seul lot) ET agrégation des immeubles
+    agrege_immeuble = defaultdict(lambda: {"surface": 0.0, "valeur": 0.0, "lat": 0.0, "lon": 0.0, "code": None})
     with gzip.open(tmp, "rt", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             type_local = row["type_local"]
             if type_local not in ("Appartement", "Maison"):
                 continue
+            mid = row["id_mutation"]
+
+            # Cas immeuble (plusieurs lots Appartement) : agrégation à part,
+            # indépendante du filtre "un seul lot" ci-dessous.
+            if type_local == "Appartement" and mid in mutations_immeuble:
+                try:
+                    surface = float(row["surface_reelle_bati"] or 0)
+                    valeur = float(row["valeur_fonciere"] or 0)
+                    lat = float(row["latitude"] or 0)
+                    lon = float(row["longitude"] or 0)
+                except ValueError:
+                    surface = valeur = lat = lon = 0.0
+                a = agrege_immeuble[mid]
+                a["surface"] += surface
+                a["valeur"] = valeur  # même valeur répétée sur chaque ligne de la mutation
+                a["lat"], a["lon"] = lat, lon
+                a["code"] = row["code_commune"]
+                continue
+
             if compte.get(row["id_mutation"], 0) != 1:
                 continue
             try:
@@ -198,6 +236,28 @@ def traiter_annee_dvf_brut(annee, communes_prix, dept_prix, locked_communes, loc
                     key_s = (taille_m, cell, typo)
                     if key_s not in locked_secteurs:
                         secteurs_prix[key_s].append(prix_m2)
+
+    # Finalisation des immeubles agrégés (une ligne par mutation multi-lots)
+    for mid, a in agrege_immeuble.items():
+        if a["surface"] <= 0 or a["valeur"] <= 0 or a["lat"] == 0 or a["lon"] == 0:
+            continue
+        prix_m2 = a["valeur"] / a["surface"]
+        if prix_m2 < 200 or prix_m2 > 20000:
+            continue
+        code = a["code"]
+
+        if code not in locked_communes_immeuble:
+            communes_prix_immeuble[code].append(prix_m2)
+
+        dept = code_to_dept(code)
+        if dept and dept not in locked_dept_immeuble:
+            dept_prix_immeuble[dept].append(prix_m2)
+
+        for taille_m in RESOLUTIONS_SECTEUR:
+            cell = grid_id(a["lat"], a["lon"], taille_m)
+            key_s = (taille_m, cell, "immeuble")
+            if key_s not in locked_secteurs:
+                secteurs_prix[key_s].append(prix_m2)
 
     os.remove(tmp)
 
@@ -484,13 +544,19 @@ print(f"Loyers {millesime_loyers} par typologie intégrés (commune + départeme
 # ---------------------------------------------------------------------------
 communes_prix_typo = defaultdict(list)
 dept_prix_typo = defaultdict(list)
-secteurs_prix_typo = defaultdict(list)  # (taille_m, cell, typo) -> [prix_m2, ...]
+secteurs_prix_typo = defaultdict(list)  # (taille_m, cell, typo) -> [prix_m2, ...] ("typo" inclut aussi "maison"/"immeuble")
+communes_prix_immeuble = defaultdict(list)
+dept_prix_immeuble = defaultdict(list)
 locked_communes = set()
 locked_dept = set()
 locked_secteurs = set()
+locked_communes_immeuble = set()
+locked_dept_immeuble = set()
 fenetre_communes = {}
 fenetre_dept = {}
 fenetre_secteurs = {}
+fenetre_communes_immeuble = {}
+fenetre_dept_immeuble = {}
 
 annees_dvf = annees_dvf_disponibles()
 print("Années DVF brutes disponibles utilisées :", annees_dvf)
@@ -499,6 +565,7 @@ for i, annee in enumerate(annees_dvf, start=1):
     traiter_annee_dvf_brut(
         annee, communes_prix_typo, dept_prix_typo, locked_communes, locked_dept,
         secteurs_prix_typo, locked_secteurs,
+        communes_prix_immeuble, dept_prix_immeuble, locked_communes_immeuble, locked_dept_immeuble,
     )
 
     nouveaux_c = 0
@@ -519,10 +586,24 @@ for i, annee in enumerate(annees_dvf, start=1):
             locked_secteurs.add(key)
             fenetre_secteurs[key] = i
             nouveaux_s += 1
+    nouveaux_ci = 0
+    for key, prix in communes_prix_immeuble.items():
+        if key not in locked_communes_immeuble and est_fiable(prix)[0]:
+            locked_communes_immeuble.add(key)
+            fenetre_communes_immeuble[key] = i
+            nouveaux_ci += 1
+    nouveaux_di = 0
+    for key, prix in dept_prix_immeuble.items():
+        if key not in locked_dept_immeuble and est_fiable(prix)[0]:
+            locked_dept_immeuble.add(key)
+            fenetre_dept_immeuble[key] = i
+            nouveaux_di += 1
     print(
         f"Après {i} an(s) : {len(locked_communes)} paires commune/typologie fiables "
         f"({nouveaux_c} nouvelles), {len(locked_dept)} départements/typologie fiables, "
-        f"{len(locked_secteurs)} secteurs/typologie fiables ({nouveaux_s} nouveaux)."
+        f"{len(locked_secteurs)} secteurs/typologie fiables ({nouveaux_s} nouveaux), "
+        f"{len(locked_communes_immeuble)} communes/immeuble fiables ({nouveaux_ci} nouvelles), "
+        f"{len(locked_dept_immeuble)} départements/immeuble fiables ({nouveaux_di} nouveaux)."
     )
 
 for key in communes_prix_typo:
@@ -531,6 +612,10 @@ for key in dept_prix_typo:
     fenetre_dept.setdefault(key, len(annees_dvf))
 for key in secteurs_prix_typo:
     fenetre_secteurs.setdefault(key, len(annees_dvf))
+for key in communes_prix_immeuble:
+    fenetre_communes_immeuble.setdefault(key, len(annees_dvf))
+for key in dept_prix_immeuble:
+    fenetre_dept_immeuble.setdefault(key, len(annees_dvf))
 
 for (code, typo), prix in communes_prix_typo.items():
     if not prix:
@@ -559,6 +644,40 @@ for (dept, typo), prix in dept_prix_typo.items():
         "fiable": fiable,
         "marge": round(marge, 3) if marge is not None else None,
     }
+
+# Immeubles (mutations à plusieurs lots Appartement, >= 3 lots) : aucune
+# donnée officielle agrégée n'existe pour cette catégorie - commune ET
+# département sont calculés nous-mêmes, comme le secteur.
+for code, prix in communes_prix_immeuble.items():
+    if not prix:
+        continue
+    fiable, marge, mediane = est_fiable(prix)
+    if code not in result:
+        result[code] = {"nom": ""}
+    result[code]["immeuble"] = {
+        "mediane": round(mediane if mediane is not None else statistics.median(prix)),
+        "nb": len(prix),
+        "fenetre_annees": fenetre_communes_immeuble[code],
+        "fiable": fiable,
+        "marge": round(marge, 3) if marge is not None else None,
+    }
+
+for dept, prix in dept_prix_immeuble.items():
+    if not prix or dept not in departements:
+        continue
+    fiable, marge, mediane = est_fiable(prix)
+    departements[dept]["immeuble"] = {
+        "mediane": round(mediane if mediane is not None else statistics.median(prix)),
+        "nb": len(prix),
+        "fenetre_annees": fenetre_dept_immeuble[dept],
+        "fiable": fiable,
+        "marge": round(marge, 3) if marge is not None else None,
+    }
+
+print(
+    f"Immeubles calculés pour {len(communes_prix_immeuble)} communes et "
+    f"{len(dept_prix_immeuble)} départements (>= {SEUIL_LOTS_IMMEUBLE} lots par mutation)."
+)
 
 # Secteurs : seules les cases FIABLES (plancher + marge) sont exportées, pour
 # ne pas alourdir le fichier avec des cases trop incertaines (le repli sur la
