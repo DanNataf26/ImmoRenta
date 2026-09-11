@@ -1,10 +1,12 @@
 {
-	email {$ACME_EMAIL:internal@example.invalid}
+	email {$ACME_EMAIL}
 }
 
-# Si DOMAIN n'est pas défini (ou vaut "localhost"), Caddy sert en HTTP simple
-# sans tenter d'obtenir de certificat Let's Encrypt.
-{$DOMAIN:localhost}
+# Si DOMAIN n'est pas défini, Caddy écoute sur le port 80 pour n'importe
+# quel hôte (accès par IP) sans tenter d'obtenir de certificat Let's
+# Encrypt. Dès que DOMAIN contient un vrai nom de domaine, Caddy bascule
+# automatiquement en HTTPS (ACME) sur ce domaine.
+{$DOMAIN}
 
 encode gzip
 
